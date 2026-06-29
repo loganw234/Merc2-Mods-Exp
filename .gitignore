@@ -1,0 +1,12 @@
+# Build artifacts
+*.asi
+*.obj
+*.exp
+*.lib
+*.o
+
+# Runtime logs
+*.log
+
+# OS cruft
+.DS_Store
