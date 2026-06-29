@@ -1,0 +1,45 @@
+name: Release mods
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.3.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install 32-bit MinGW cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686 zip
+
+      - name: Build all mods
+        run: make
+
+      - name: Package mods into zips
+        run: |
+          mkdir dist
+          zip -j dist/debug-overlay.zip   mods/debug-overlay/debug_overlay.asi   mods/debug-overlay/debug_overlay.ini
+          zip -j dist/dev-cheat-menu.zip  mods/dev-cheat-menu/dev_cheat_menu.asi  mods/dev-cheat-menu/dev_cheat_menu.ini
+          zip -j dist/lua-bridge.zip      mods/lua-bridge/lua_bridge.asi          mods/lua-bridge/lua_bridge.ini          mods/lua-bridge/lua_console.exe
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || inputs.tag }}
+          name: ${{ github.ref_name || inputs.tag }}
+          generate_release_notes: true
+          files: dist/*.zip
