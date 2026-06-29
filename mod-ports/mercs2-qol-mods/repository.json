@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "name": "Mercenaries 2 Experimental Mods",
+  "maintainer": "loganw234",
+  "url": "https://github.com/loganw234/Merc2-Mods-Exp",
+  "description": "Experimental mods for Mercenaries 2: World in Flames.",
+  "mods": [
+    {
+      "slug": "lua-bridge",
+      "name": "Lua Bridge",
+      "type": "asi",
+      "description": "Exposes the game's internal Lua state over a localhost TCP port.",
+      "version": "0.1.0",
+      "assets": ["lua_bridge.asi", "lua_bridge.ini"]
+    },
+    {
+      "slug": "dev-cheat-menu",
+      "name": "Dev Cheat Menu",
+      "type": "asi",
+      "description": "Binds a key (default: Insert) to trigger the built-in developer cheat menu.",
+      "version": "0.1.0",
+      "assets": ["dev_cheat_menu.asi", "dev_cheat_menu.ini"]
+    },
+    {
+      "slug": "debug-overlay",
+      "name": "Debug Overlay",
+      "type": "asi",
+      "description": "Custom Direct3D9 screen overlay for real-time debugging stats.",
+      "version": "0.1.0",
+      "assets": ["debug_overlay.asi", "debug_overlay.ini"]
+    }
+  ]
+}
