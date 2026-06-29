@@ -24,13 +24,13 @@ jobs:
           sudo apt-get install -y gcc-mingw-w64-i686
 
       - name: Build all mods
-        run: make -C mod-ports/mercs2-qol-mods
+        run: make
 
       - name: Collect built .asi files (and any companion .ini configs)
         run: |
           mkdir -p dist
-          cp mod-ports/mercs2-qol-mods/mods/*/*.asi dist/
-          cp mod-ports/mercs2-qol-mods/mods/*/*.ini dist/ 2>/dev/null || true
+          cp mods/*/*.asi dist/
+          cp mods/*/*.ini dist/ 2>/dev/null || true
           ls -la dist
 
       - name: Upload build artifacts
