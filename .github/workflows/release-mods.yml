@@ -33,7 +33,6 @@ jobs:
         run: |
           mkdir dist
           zip -j dist/debug-overlay.zip   mods/debug-overlay/debug_overlay.asi   mods/debug-overlay/debug_overlay.ini
-          zip -j dist/dev-cheat-menu.zip  mods/dev-cheat-menu/dev_cheat_menu.asi  mods/dev-cheat-menu/dev_cheat_menu.ini
           
           # Stage and package lua-bridge with its folders
           mkdir -p dist/lua-bridge-pkg/OnBoot
