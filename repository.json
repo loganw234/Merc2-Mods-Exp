@@ -7,7 +7,7 @@
   "mods": [
     {
       "slug": "lua-bridge-DEV",
-      "name": "Lua Bridge",
+      "name": "Lua Bridge (DEV)",
       "type": "asi",
       "description": "Exposes the game's internal Lua state over a localhost TCP port.",
       "version": "0.1.2",
@@ -15,7 +15,7 @@
     },
     {
       "slug": "debug-overlay-DEV",
-      "name": "Debug Overlay",
+      "name": "Debug Overlay (DEV)",
       "type": "asi",
       "description": "Custom Direct3D9 screen overlay for real-time debugging stats.",
       "version": "0.1.2",
@@ -23,7 +23,7 @@
     },
     {
       "slug": "multiplayer-restore-DEV",
-      "name": "Multiplayer Restore",
+      "name": "Multiplayer Restore (DEV)",
       "type": "asi",
       "description": "Restores Mercenaries 2 online multiplayer by routing EA matchmaking traffic to a private server.",
       "version": "0.1.2",
