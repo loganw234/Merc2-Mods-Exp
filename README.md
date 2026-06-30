@@ -17,6 +17,10 @@ This repository supports live updates directly through the [Modkit](https://gith
 
 ![Connecting Repo to Modkit](img/addingrepo.png)
 
+Once added, the experimental development builds of the mods (marked with a `(DEV)` suffix) will become available to download and enable in your **Mod Market**:
+
+![Mod Market with DEV Mods](img/repoadded.png)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
