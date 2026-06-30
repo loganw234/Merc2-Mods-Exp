@@ -32,21 +32,22 @@ jobs:
       - name: Package mods into zips
         run: |
           mkdir dist
-          zip -j dist/debug-overlay.zip   mods/debug-overlay/debug_overlay.asi   mods/debug-overlay/debug_overlay.ini
+          zip -j dist/debug-overlay-DEV.zip mods/debug-overlay-DEV/debug_overlay.asi mods/debug-overlay-DEV/debug_overlay.ini
+          zip -j dist/multiplayer-restore-DEV.zip mods/multiplayer-restore-DEV/multiplayer_restore.asi mods/multiplayer-restore-DEV/multiplayer_restore.ini
           
           # Stage and package lua-bridge with its folders
           mkdir -p dist/lua-bridge-pkg/OnBoot
           mkdir -p dist/lua-bridge-pkg/OnLoad
           mkdir -p dist/lua-bridge-pkg/OnKey
-          cp mods/lua-bridge/lua_bridge.asi dist/lua-bridge-pkg/
-          cp mods/lua-bridge/lua_bridge.ini dist/lua-bridge-pkg/
-          cp mods/lua-bridge/lua_loader.ini dist/lua-bridge-pkg/
-          cp mods/lua-bridge/lua_console.exe dist/lua-bridge-pkg/
-          cp mods/lua-bridge/scripts/OnBoot/print_boot.lua dist/lua-bridge-pkg/OnBoot/
-          cp mods/lua-bridge/scripts/OnLoad/print_load.lua dist/lua-bridge-pkg/OnLoad/
-          cp mods/lua-bridge/scripts/OnKey/test_key.lua dist/lua-bridge-pkg/OnKey/
+          cp mods/lua-bridge-DEV/lua_bridge.asi dist/lua-bridge-pkg/
+          cp mods/lua-bridge-DEV/lua_bridge.ini dist/lua-bridge-pkg/
+          cp mods/lua-bridge-DEV/lua_loader.ini dist/lua-bridge-pkg/
+          cp mods/lua-bridge-DEV/lua_console.exe dist/lua-bridge-pkg/
+          cp mods/lua-bridge-DEV/scripts/OnBoot/print_boot.lua dist/lua-bridge-pkg/OnBoot/
+          cp mods/lua-bridge-DEV/scripts/OnLoad/print_load.lua dist/lua-bridge-pkg/OnLoad/
+          cp mods/lua-bridge-DEV/scripts/OnKey/test_key.lua dist/lua-bridge-pkg/OnKey/
           cd dist/lua-bridge-pkg
-          zip -r ../lua-bridge.zip .
+          zip -r ../lua-bridge-DEV.zip .
           cd ../..
           rm -rf dist/lua-bridge-pkg
 

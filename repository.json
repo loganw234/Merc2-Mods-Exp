@@ -6,7 +6,7 @@
   "description": "Experimental mods for Mercenaries 2: World in Flames.",
   "mods": [
     {
-      "slug": "lua-bridge",
+      "slug": "lua-bridge-DEV",
       "name": "Lua Bridge",
       "type": "asi",
       "description": "Exposes the game's internal Lua state over a localhost TCP port.",
@@ -14,12 +14,21 @@
       "assets": ["lua_bridge.asi", "lua_bridge.ini"]
     },
     {
-      "slug": "debug-overlay",
+      "slug": "debug-overlay-DEV",
       "name": "Debug Overlay",
       "type": "asi",
       "description": "Custom Direct3D9 screen overlay for real-time debugging stats.",
       "version": "0.1.0",
       "assets": ["debug_overlay.asi", "debug_overlay.ini"]
+    },
+    {
+      "slug": "multiplayer-restore-DEV",
+      "name": "Multiplayer Restore",
+      "type": "asi",
+      "description": "Restores Mercenaries 2 online multiplayer by routing EA matchmaking traffic to a private server.",
+      "version": "0.1.0",
+      "assets": ["multiplayer_restore.asi", "multiplayer_restore.ini"]
     }
   ]
 }
+
