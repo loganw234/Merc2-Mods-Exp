@@ -1,4 +1,4 @@
-# Makefile for lua_bridge.asi — built against the Mercs2 mod stdlib.
+# Makefile for lua_bridge_DEV.asi — built against the Mercs2 mod stdlib.
 #
 # Pattern intentionally mirrors mods/quiet-freeplay-vo so any user familiar
 # with one mod can build the other.
@@ -13,8 +13,8 @@ include ../../sdk/sdk.mk
 CC_MINGW    = i686-w64-mingw32-gcc
 STRIP_MINGW = i686-w64-mingw32-strip
 
-TARGET      = lua_bridge.asi
-SRC         = lua_bridge.c
+TARGET      = lua_bridge_DEV.asi
+SRC         = lua_bridge_DEV.c
 CFLAGS      = -O2 -Wall -Wno-unused-function -Wno-unused-variable -static-libgcc -shared -Wl,--enable-stdcall-fixup $(M2_CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS     = -lws2_32 -lkernel32 -luser32
 
@@ -31,10 +31,10 @@ mingw: $(SRC)
 	$(CC_MINGW) $(CFLAGS) -o $(TARGET) $(SRC) $(M2_SRCS) $(LDFLAGS)
 	$(STRIP_MINGW) $(TARGET)
 	@echo "Built: $(TARGET) ($$(wc -c < $(TARGET)) bytes)"
-	@echo "Copy to: <game>/scripts/  (along with lua_bridge.ini)"
+	@echo "Copy to: <game>/scripts/  (along with lua_bridge_DEV.ini)"
 
 clean:
-	rm -f $(TARGET) *.obj *.exp *.lib lua_bridge.log
+	rm -f $(TARGET) *.obj *.exp *.lib lua_bridge_DEV.log
 
 help:
 	@echo "make mingw   — Cross-compile with MinGW (default)"

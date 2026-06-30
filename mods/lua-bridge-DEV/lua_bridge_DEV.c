@@ -1452,7 +1452,7 @@ static void OnIniKV(void* ud, const char* key, const char* value) {
 
 static void LoadConfig(void) {
     char ini_path[MAX_PATH];
-    m2_module_path(g_hModule, "lua_bridge.ini", ini_path, sizeof(ini_path));
+    m2_module_path(g_hModule, "lua_bridge_DEV.ini", ini_path, sizeof(ini_path));
     m2_ini_parse(ini_path, OnIniKV, NULL);
 }
 

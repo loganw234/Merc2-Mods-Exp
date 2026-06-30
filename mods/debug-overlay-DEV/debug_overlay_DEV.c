@@ -843,7 +843,7 @@ static HMODULE g_hModule = NULL;
 
 static void LoadConfig(void) {
     char ini_path[MAX_PATH];
-    m2_module_path(g_hModule, "debug_overlay.ini", ini_path, sizeof(ini_path));
+    m2_module_path(g_hModule, "debug_overlay_DEV.ini", ini_path, sizeof(ini_path));
     cfg_set_defaults();
     m2_ini_parse(ini_path, OnIniKV, NULL);
 }

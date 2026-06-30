@@ -1,4 +1,4 @@
-# Makefile for multiplayer_restore.asi — built against the Mercs2 mod stdlib.
+# Makefile for multiplayer_restore_DEV.asi — built against the Mercs2 mod stdlib.
 #
 # Pattern intentionally mirrors mods/quiet-freeplay-vo so any user familiar
 # with one mod can build the other.
@@ -13,8 +13,8 @@ include ../../sdk/sdk.mk
 CC_MINGW    = i686-w64-mingw32-gcc
 STRIP_MINGW = strip
 
-TARGET      = multiplayer_restore.asi
-SRC         = multiplayer_restore.c
+TARGET      = multiplayer_restore_DEV.asi
+SRC         = multiplayer_restore_DEV.c
 CFLAGS      = -O2 -Wall -Wno-unused-function -static-libgcc -shared -Wl,--enable-stdcall-fixup $(M2_CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS     = -lws2_32 -lwintrust -lkernel32 -luser32
 
@@ -26,10 +26,10 @@ mingw: $(SRC)
 	$(CC_MINGW) $(CFLAGS) -o $(TARGET) $(SRC) $(M2_SRCS) $(LDFLAGS)
 	$(STRIP_MINGW) $(TARGET)
 	@echo "Built: $(TARGET) ($$(wc -c < $(TARGET)) bytes)"
-	@echo "Copy to: <game>/scripts/  (along with multiplayer_restore.ini)"
+	@echo "Copy to: <game>/scripts/  (along with multiplayer_restore_DEV.ini)"
 
 clean:
-	rm -f $(TARGET) *.obj *.exp *.lib multiplayer_restore.log
+	rm -f $(TARGET) *.obj *.exp *.lib multiplayer_restore_DEV.log
 
 help:
 	@echo "make mingw   — Cross-compile with MinGW (default)"
