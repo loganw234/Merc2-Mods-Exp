@@ -10,7 +10,7 @@
       "name": "Lua Bridge",
       "type": "asi",
       "description": "Exposes the game's internal Lua state over a localhost TCP port.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "assets": ["lua_bridge_DEV.asi", "lua_bridge_DEV.ini"]
     },
     {
@@ -18,7 +18,7 @@
       "name": "Debug Overlay",
       "type": "asi",
       "description": "Custom Direct3D9 screen overlay for real-time debugging stats.",
-      "version": "0.1.0",
+      "version": "0.1.2",
       "assets": ["debug_overlay_DEV.asi", "debug_overlay_DEV.ini"]
     },
     {
@@ -26,7 +26,7 @@
       "name": "Multiplayer Restore",
       "type": "asi",
       "description": "Restores Mercenaries 2 online multiplayer by routing EA matchmaking traffic to a private server.",
-      "version": "0.1.0",
+      "version": "0.1.2",
       "assets": ["multiplayer_restore_DEV.asi", "multiplayer_restore_DEV.ini"]
     }
   ]
