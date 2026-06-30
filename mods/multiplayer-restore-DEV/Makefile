@@ -11,7 +11,11 @@
 include ../../sdk/sdk.mk
 
 CC_MINGW    = i686-w64-mingw32-gcc
-STRIP_MINGW = strip
+ifeq ($(OS),Windows_NT)
+    STRIP_MINGW = strip
+else
+    STRIP_MINGW = i686-w64-mingw32-strip
+endif
 
 TARGET      = multiplayer_restore_DEV.asi
 SRC         = multiplayer_restore_DEV.c
