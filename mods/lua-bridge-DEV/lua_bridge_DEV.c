@@ -358,6 +358,23 @@ static ChunkNode* g_inQueue_head = NULL;
 static ChunkNode* g_inQueue_tail = NULL;
 static volatile LONG g_PendingScripts = 0;
 
+/* Loader lifecycle flags — moved up so RecomputeHotWork can see them. */
+static volatile LONG g_OnLoadTriggered = 0;
+static volatile LONG g_OnLoadExecuted  = 0;
+
+/* Hot-path gate. When 0, GatedPump fast-returns after a single volatile
+ * load. Set to 1 whenever there might be pump work (script queued, or
+ * OnLoad transition pending); recomputed from ground-truth after any
+ * event that could clear it. Idempotent — occasional stale-1 just costs
+ * one extra slow-path traversal, no correctness impact. */
+static volatile LONG g_hotWork = 0;
+
+static __inline void RecomputeHotWork(void) {
+    LONG onload_pending = (g_OnLoadTriggered && !g_OnLoadExecuted) ? 1 : 0;
+    LONG scripts_pending = (g_PendingScripts > 0) ? 1 : 0;
+    g_hotWork = onload_pending | scripts_pending;
+}
+
 /* Per-thread re-entry guard — prevents the executor from recursing
  * into itself if a capture detour fires mid-LuaDoString. */
 static MOD_THREAD BOOL t_inBridgeExec = FALSE;
@@ -413,6 +430,7 @@ static void InQueuePush(const char* code, size_t len) {
     LeaveCriticalSection(&g_inMtx);
 
     InterlockedIncrement(&g_PendingScripts);
+    g_hotWork = 1;
 }
 
 static ChunkNode* InQueuePop(void) {
@@ -644,21 +662,38 @@ static void LuaDoString(void* L, const char* code, size_t code_len,
     *base_ptr = saved_base;
 }
 
+static void RegisterTcpLib(void* L);
+static void RegisterLoaderLib(void* L);
+static void ExecuteLuaFolder(void* L, const char* folder_name);
+static void InitializeKeyScripts(void);
+
 /* ------------------------------------------------------------------------ *
  * Pump — drain the input queue against a verified-valid L
  * ------------------------------------------------------------------------ */
 static void PumpQueue(void* L_for_exec) {
     char result_buf[16384];
+    int L_ok;
 
     if (g_PendingScripts <= 0) return;
     if (t_inBridgeExec) return;
+
+    /* Re-register our libs ONCE at batch start, not per chunk. Defends
+     * against engine _G resets between batches (menu → mission,
+     * cutscene entry, etc.); a wipe mid-batch is essentially impossible
+     * since chunks drain back-to-back. luaL_register is idempotent, so
+     * this is also cheap. */
+    L_ok = (L_for_exec && LooksLikeLuaState(L_for_exec));
+    if (L_ok) {
+        RegisterTcpLib(L_for_exec);
+        RegisterLoaderLib(L_for_exec);
+    }
 
     for (;;) {
         ChunkNode* node = InQueuePop();
         if (!node) return;
 
         t_inBridgeExec = TRUE;
-        if (L_for_exec && LooksLikeLuaState(L_for_exec)) {
+        if (L_ok) {
             LuaDoString(L_for_exec, node->code, node->len, result_buf, sizeof(result_buf));
         } else {
             _snprintf_s(result_buf, sizeof(result_buf), _TRUNCATE,
@@ -673,14 +708,12 @@ static void PumpQueue(void* L_for_exec) {
     }
 }
 
-static volatile LONG g_OnLoadTriggered = 0;
-static volatile LONG g_OnLoadExecuted = 0;
-
-static void RegisterTcpLib(void* L);
-static void ExecuteLuaFolder(void* L, const char* folder_name);
-static void InitializeKeyScripts(void);
-
 static __inline void GatedPump(void* L_arg0) {
+    /* Fast path: single volatile load. Fires thousands of times per
+     * second from detours; anything else here is measurable. */
+    if (!g_hotWork) return;
+
+    /* Slow path: something wants doing. */
     if (g_loader_enabled && g_loader_onload && g_OnLoadTriggered && !g_OnLoadExecuted) {
         if (LooksLikeLuaState(L_arg0)) {
             g_OnLoadExecuted = 1;
@@ -688,53 +721,57 @@ static __inline void GatedPump(void* L_arg0) {
         }
     }
 
-    if (g_PendingScripts <= 0) return;
-    if (t_inBridgeExec)        return;
-    if (!LooksLikeLuaState(L_arg0)) return;
-    PumpQueue(L_arg0);
+    if (g_PendingScripts > 0 && !t_inBridgeExec && LooksLikeLuaState(L_arg0)) {
+        PumpQueue(L_arg0);
+    }
+
+    RecomputeHotWork();
 }
 
 static void CaptureL(void* L, const char* via) {
-    /* Fast path: same L as last capture — return without logging or
-     * touching the seen-set. This is the common case (every detour
-     * fire on the same VM). */
+    /* Fast path #1: same L as last capture. This is the common case
+     * (every detour fire on the same VM). Single pointer compare. */
     if (!L || L == g_LuaState) return;
-    if (!LooksLikeLuaState(L)) return;
-    g_LuaState = L;
 
-    /* Dedupe log spam: the engine flips between multiple Lua VMs
-     * (frontend + gameplay + occasional coroutines) on the same
-     * main thread, so g_LuaState legitimately changes many times
-     * per second. Log only the first time we observe each distinct
-     * L. 8 slots is enough for any realistic game state. */
+    /* Fast path #2: L is in seen[]. We've already validated + registered
+     * on this VM before; the engine just flipped back to it. Scanning a
+     * small pointer array is pure L1 (~5 cycles) versus LooksLikeLuaState
+     * which does 4 VirtualQuery syscalls (~2µs). This is the biggest
+     * hot-path win — the engine flips between frontend / gameplay VMs
+     * many times per second. */
     static void* seen[8] = {0};
     int i;
+    int free_slot = -1;
     for (i = 0; i < 8; ++i) {
-        if (seen[i] == L) return;            /* already logged */
-        if (seen[i] == NULL) {
-            seen[i] = L;
-            m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
-            RegisterTcpLib(L);
+        if (seen[i] == L) { g_LuaState = L; return; }
+        if (seen[i] == NULL) { free_slot = i; break; }
+    }
 
-            if (g_loader_enabled) {
-                static int key_loader_initialized = 0;
-                if (!key_loader_initialized) {
-                    key_loader_initialized = 1;
-                    InitializeKeyScripts();
-                }
-            }
+    /* Slow path: L we've never seen. Validate, register, log, remember. */
+    if (!LooksLikeLuaState(L)) return;
+    g_LuaState = L;
+    if (free_slot < 0) return;  /* seen[] full — silently drop the log entry */
+    seen[free_slot] = L;
 
-            if (g_loader_enabled && g_loader_onboot) {
-                static int onboot_executed = 0;
-                if (!onboot_executed) {
-                    onboot_executed = 1;
-                    ExecuteLuaFolder(L, "OnBoot");
-                }
-            }
-            return;
+    m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
+    RegisterTcpLib(L);
+    RegisterLoaderLib(L);
+
+    if (g_loader_enabled) {
+        static int key_loader_initialized = 0;
+        if (!key_loader_initialized) {
+            key_loader_initialized = 1;
+            InitializeKeyScripts();
         }
     }
-    /* seen[] full — silently update without logging. */
+
+    if (g_loader_enabled && g_loader_onboot) {
+        static int onboot_executed = 0;
+        if (!onboot_executed) {
+            onboot_executed = 1;
+            ExecuteLuaFolder(L, "OnBoot");
+        }
+    }
 }
 
 /* ------------------------------------------------------------------------ *
@@ -747,6 +784,7 @@ static int __cdecl DetourNoopStub(void* L) {
             if (strstr(msg, "GlobalExit - Complete")) {
                 m2_logf("[*] lua_bridge: OnLoad milestone reached (GlobalExit - Complete). Queuing OnLoad scripts.");
                 InterlockedExchange(&g_OnLoadTriggered, 1);
+                g_hotWork = 1;
             }
         }
     }
@@ -1120,6 +1158,11 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
 
     qsort(scripts, script_count, sizeof(LuaScriptFile), CompareLoadOrder);
 
+    /* Re-register libs before running the batch — same reasoning as
+     * PumpQueue: engine may have wiped _G between capture and now. */
+    RegisterTcpLib(L);
+    RegisterLoaderLib(L);
+
     for (i = 0; i < script_count; ++i) {
         FILE* f = fopen(scripts[i].path, "rb");
         if (f) {
@@ -1287,7 +1330,97 @@ static void RegisterTcpLib(void* L) {
         : "c"(L), "a"(libname), "r"(table), "r"(func_addr)
         : "edx", "memory"
     );
-    m2_logf("[*] lua_bridge: Registered Tcp.Send globally");
+    static int logged = 0;
+    if (!logged) { logged = 1; m2_logf("[*] lua_bridge: Registered Tcp.Send globally"); }
+}
+
+/* ------------------------------------------------------------------------ *
+ * Expose Loader.Printf to Lua — a lightweight replacement for the engine's
+ * Debug.Printf, aimed at custom scripts that want their own uncluttered log.
+ * Debug.Printf is called thousands of times per frame from stock scripts, so
+ * routing script debug output there gets drowned out. Loader.Printf writes
+ * to a dedicated <module dir>\lua_loader_printf.log instead.
+ *
+ * Usage from Lua:
+ *   Loader.Printf("[give_cash] +10000 cash")
+ *   Loader.Printf("tag", "value")   -- multiple string args join tab-separated
+ * ------------------------------------------------------------------------ */
+static HANDLE            g_LoaderPrintfLog = INVALID_HANDLE_VALUE;
+static CRITICAL_SECTION  g_LoaderPrintfMtx;
+static int               g_LoaderPrintfMtxInit = 0;
+
+static void InitLoaderPrintfLog(void) {
+    char path[MAX_PATH];
+    if (!g_LoaderPrintfMtxInit) {
+        InitializeCriticalSection(&g_LoaderPrintfMtx);
+        g_LoaderPrintfMtxInit = 1;
+    }
+    m2_module_path(g_hModule, "lua_loader_printf.log", path, sizeof(path));
+    g_LoaderPrintfLog = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ,
+                                    NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_LoaderPrintfLog == INVALID_HANDLE_VALUE) {
+        m2_logf("[!] lua_bridge: failed to open %s GLE=%lu",
+                path, (unsigned long)GetLastError());
+    } else {
+        m2_logf("[*] lua_bridge: Loader.Printf log opened at %s", path);
+    }
+}
+
+static int LuaLoaderPrintf(void* L) {
+    char msg[2048];
+    int  joined;
+    DWORD written;
+    size_t len;
+
+    if (g_LoaderPrintfLog == INVALID_HANDLE_VALUE) return 0;
+
+    /* Join every string arg tab-separated (mirrors Lua's print()). Non-string
+     * args are silently skipped — matches m2_lua_join_strings semantics.
+     * On extraction failure, still emit a marker line so the log tells us
+     * the C fn was reached rather than staying silent. */
+    joined = m2_lua_join_strings(L, msg, (int)sizeof(msg) - 32);
+    if (joined <= 0) {
+        len = (size_t)_snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                                  "[Loader.Printf: no string args (joined=%d)]", joined);
+    } else {
+        len = strlen(msg);
+    }
+    if (len > sizeof(msg) - 2) len = sizeof(msg) - 2;
+    msg[len++] = '\r';
+    msg[len++] = '\n';
+
+    /* NB: no FlushFileBuffers here — it forces a synchronous disk sync
+     * that can stall the game's Lua thread for seconds (AV, HDD, cloud
+     * sync). WriteFile alone commits to the OS write cache, which is
+     * enough for a live debug log; entries survive normal shutdown. */
+    EnterCriticalSection(&g_LoaderPrintfMtx);
+    WriteFile(g_LoaderPrintfLog, msg, (DWORD)len, &written, NULL);
+    LeaveCriticalSection(&g_LoaderPrintfMtx);
+    return 0;
+}
+
+static const luaL_Reg loader_lib[] = {
+    {"Printf", LuaLoaderPrintf},
+    {NULL, NULL}
+};
+
+static void RegisterLoaderLib(void* L) {
+    HMODULE base = GetModuleHandleA(NULL);
+    if (!base) return;
+    DWORD func_addr = (DWORD)base + g_rvas->luaL_register;
+    const char* libname = "Loader";
+    const luaL_Reg* table = loader_lib;
+
+    __asm__ volatile (
+        "push %2\n\t"        // Push table pointer (stack arg)
+        "call *%3\n\t"       // Call luaL_register
+        "add $4, %%esp\n\t"  // Clean stack (4 bytes)
+        :
+        : "c"(L), "a"(libname), "r"(table), "r"(func_addr)
+        : "edx", "memory"
+    );
+    static int logged = 0;
+    if (!logged) { logged = 1; m2_logf("[*] lua_bridge: Registered Loader.Printf globally"); }
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1483,6 +1616,7 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     InitializeCriticalSection(&g_inMtx);
     InitializeCriticalSection(&g_outMtx);
     InitChunkSource();
+    InitLoaderPrintfLog();
 
     mod = GetModuleHandleA(NULL);
     if (!mod) {
