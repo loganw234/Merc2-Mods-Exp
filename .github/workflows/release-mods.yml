@@ -51,13 +51,11 @@ jobs:
           cp mods/lua-bridge-DEV/lua_bridge_DEV.asi dist/
           cp mods/lua-bridge-DEV/lua_bridge_DEV.ini dist/
           cp mods/lua-bridge-DEV/lua_loader.ini dist/
-          cp mods/lua-bridge-DEV/lua_console.exe dist/
           cp mods/lua-bridge-DEV/lua_console.py dist/
           
           cp mods/lua-bridge-DEV/lua_bridge_DEV.asi dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/lua_bridge_DEV.ini dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/lua_loader.ini dist/lua-bridge-pkg/
-          cp mods/lua-bridge-DEV/lua_console.exe dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/lua_console.py dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/scripts/OnBoot/print_boot.lua dist/lua-bridge-pkg/OnBoot/
           cp mods/lua-bridge-DEV/scripts/OnLoad/print_load.lua dist/lua-bridge-pkg/OnLoad/
@@ -78,5 +76,4 @@ jobs:
             dist/*.zip
             dist/*.asi
             dist/*.ini
-            dist/*.exe
             dist/*.py
