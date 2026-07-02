@@ -20,7 +20,7 @@ endif
 TARGET      = multiplayer_restore_DEV.asi
 SRC         = multiplayer_restore_DEV.c
 CFLAGS      = -O2 -Wall -Wno-unused-function -static-libgcc -shared -Wl,--enable-stdcall-fixup $(M2_CFLAGS) $(EXTRA_CFLAGS)
-LDFLAGS     = -lws2_32 -lwintrust -lkernel32 -luser32
+LDFLAGS     = -lws2_32 -lkernel32 -luser32
 
 .PHONY: all clean mingw help
 

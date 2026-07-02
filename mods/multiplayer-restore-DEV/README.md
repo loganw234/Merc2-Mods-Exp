@@ -17,14 +17,14 @@ stripped of the Lua bridge so it cleanly fits the QoL mods framework.
 1. **DNS redirect** — hooks `ws2_32` resolvers so `*.ea.com`,
    `*.gamespy.com`, and `fesl*` resolve to the configured private
    server (default `refesl.live`).
-2. **Cert blindfold** — hooks `wintrust!WinVerifyTrust` to accept the
-   private server's self-signed cert blob. Local file/catalog cert
-   validation is untouched.
-3. **Time spoof** — pins the clock returned by Win32 + CRT time APIs
-   to a date inside the served cert's validity window. Optional.
-4. **FESL CA pubkey patch** — replays MLoader's 128-byte `.rdata`
+2. **FESL CA pubkey patch** — replays MLoader's 128-byte `.rdata`
    write at RVA `0x768378` so the game's SSL stack accepts the
    private server's cert chain. Gated on a SecuROM-unpack poll.
+
+Earlier revisions also included a `WinVerifyTrust` cert-blob
+blindfold and a Win32/CRT clock spoof (pinning time to 2012-06-15).
+Both were removed after live testing showed the CA key patch alone
+is sufficient to let the private server's cert chain validate.
 
 What it does NOT do: Lua bridge, REPL, modding hooks. Use the
 upstream Merc2Fix ASI if you want those.
@@ -34,7 +34,8 @@ upstream Merc2Fix ASI if you want those.
 1. Build (see below) or drop a prebuilt `multiplayer_restore.asi`
    into your Mercenaries 2 install folder.
 2. Drop `multiplayer_restore.ini` alongside it (only needed if you
-   want to override the default server or disable the clock spoof).
+   want to override the default server). The ASI will auto-generate
+   a commented default INI on first launch if none is present.
 3. Launch the game. Connect online normally — no MLoader required.
 
 ## Build
@@ -61,12 +62,18 @@ Output: `multiplayer_restore.asi`.
 ip = refesl.live              ; hostname or dotted-quad
 
 [compat]
-spoof_clock = 1               ; 1 = spoof to 2012-06-15 (recommended)
+patch_bversion = 1            ; 1 = advertise a specific client build
+bversion       = 1555000000   ; build integer sent to FESL
+
+[debug]
+; WARNING: hook toggles for advanced testing only.
+hook_dns  = 1
+patch_ca  = 1
 ```
 
 ## Status
 
-**Fully verified and tested.** Builds cleanly using MinGW (`i686-w64-mingw32-gcc`) and has been fully runtime-tested and verified working on a real game session loaded with `pmc_bb.dll` (v0.2.0). All hooks arm cleanly, the DNS redirect, cert verification bypass, and CA pubkey patch work as expected, restoring online multiplayer connectivity.
+**Fully verified and tested.** Builds cleanly using MinGW (`i686-w64-mingw32-gcc`) and has been fully runtime-tested and verified working on a real game session loaded with `pmc_bb.dll` (v0.2.0). Hooks arm cleanly; the DNS redirect and CA pubkey patch work as expected, restoring online multiplayer connectivity.
 
 ## Acknowledgements
 

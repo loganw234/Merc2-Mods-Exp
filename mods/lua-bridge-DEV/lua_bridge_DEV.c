@@ -1583,9 +1583,49 @@ static void OnIniKV(void* ud, const char* key, const char* value) {
     }
 }
 
+/* Baked-in defaults, written to disk if the .ini is missing. Keeps the
+ * .asi self-sufficient — users can drop the .asi alone and get a
+ * commented, editable config on first launch. */
+static const char kDefaultIni[] =
+    "; lua-bridge configuration.\n"
+    "; Drop this next to lua_bridge.asi in your game folder.\n"
+    "\n"
+    "[repl]\n"
+    "; Host to bind the REPL listener on. 127.0.0.1 = localhost-only,\n"
+    "; which is what you want unless you're routing through a tunnel.\n"
+    "host = 127.0.0.1\n"
+    "\n"
+    "; Port for the REPL listener. Matches the default the upstream\n"
+    "; tools/lua_repl.py and tools/lua_console.py expect.\n"
+    "port = 27050\n"
+    "\n"
+    "[loader]\n"
+    "; Enable or disable the native Lua Loader (1 = enabled, 0 = disabled)\n"
+    "loader_enabled = 1\n"
+    "\n"
+    "; Load scripts in scripts/OnBoot/ once captured (1 = enabled, 0 = disabled)\n"
+    "loader_onboot = 1\n"
+    "\n"
+    "; Load scripts in scripts/OnLoad/ once game enters world (1 = enabled, 0 = disabled)\n"
+    "loader_onload = 1\n"
+    "\n"
+    "; Delay (in milliseconds) between executing consecutive scripts\n"
+    "loader_delay_ms = 50\n";
+
+static void EnsureIniDefault(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (f) { fclose(f); return; }        /* user's file wins */
+    f = fopen(path, "w");
+    if (!f) return;
+    fputs(kDefaultIni, f);
+    fclose(f);
+    m2_logf("[*] lua_bridge: wrote default %s", path);
+}
+
 static void LoadConfig(void) {
     char ini_path[MAX_PATH];
     m2_module_path(g_hModule, "lua_bridge_DEV.ini", ini_path, sizeof(ini_path));
+    EnsureIniDefault(ini_path);
     m2_ini_parse(ini_path, OnIniKV, NULL);
 }
 

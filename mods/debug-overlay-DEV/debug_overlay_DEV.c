@@ -841,10 +841,77 @@ static void hook_d3d9ex_vtable(IDirect3D9Ex* d3d_ex) {
  * ======================================================================== */
 static HMODULE g_hModule = NULL;
 
+/* Baked-in defaults, written to disk if the .ini is missing. Keeps the
+ * .asi self-sufficient — users can drop the .asi alone and get a
+ * commented, editable config on first launch. */
+static const char kDefaultIni[] =
+    "; debug-overlay configuration.\n"
+    "; Drop this next to debug_overlay.asi in your game folder.\n"
+    "\n"
+    "[overlay]\n"
+    "; Master on/off. Set 0 to load the mod but skip all rendering (the TCP\n"
+    "; server still accepts commands; they just won't be drawn).\n"
+    "enabled = 1\n"
+    "\n"
+    "; Column count for the grid layout (1..4).\n"
+    ";   1 = single column, items stack vertically (default)\n"
+    ";   2..4 = grid with that many columns, row-major fill\n"
+    "columns = 1\n"
+    "\n"
+    "; Font selection. Any installed Windows font face name works.\n"
+    "; Consolas is monospace and reads well at small sizes.\n"
+    "font_name = Consolas\n"
+    "font_size = 14\n"
+    "\n"
+    "; Internal padding (px) around the labels inside the background box.\n"
+    "padding = 8\n"
+    "\n"
+    "; Extra horizontal space between columns (px). Only used if columns > 1.\n"
+    "col_spacing = 24\n"
+    "\n"
+    "; Extra vertical space between rows beyond font_size (px).\n"
+    "line_spacing = 4\n"
+    "\n"
+    "; Background color as 6-digit hex RRGGBB. Alpha is separate.\n"
+    "bg_color  = 000000\n"
+    "bg_alpha  = 0.65\n"
+    "\n"
+    "; Default text color as 6-digit hex RRGGBB. Per-label override via the\n"
+    "; COLOR command at runtime.\n"
+    "text_color = FFFFFF\n"
+    "\n"
+    "[anchor]\n"
+    "; Where to pin the overlay. One of:\n"
+    ";   top-left, top-right, bottom-left, bottom-right, custom\n"
+    "position = top-left\n"
+    "\n"
+    "; Distance from the anchor in pixels. For 'custom' these are absolute\n"
+    "; screen coordinates of the top-left corner.\n"
+    "x = 16\n"
+    "y = 16\n"
+    "\n"
+    "[server]\n"
+    "; TCP listener for SET / CLEAR / COLOR / SHOW / HIDE / PING commands.\n"
+    "; Default 127.0.0.1 keeps it local-only. Default port is 27051 (one\n"
+    "; above the Lua bridge's 27050).\n"
+    "host = 127.0.0.1\n"
+    "port = 27051\n";
+
+static void EnsureIniDefault(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (f) { fclose(f); return; }
+    f = fopen(path, "w");
+    if (!f) return;
+    fputs(kDefaultIni, f);
+    fclose(f);
+    m2_logf("[*] debug_overlay: wrote default %s", path);
+}
+
 static void LoadConfig(void) {
     char ini_path[MAX_PATH];
     m2_module_path(g_hModule, "debug_overlay_DEV.ini", ini_path, sizeof(ini_path));
     cfg_set_defaults();
+    EnsureIniDefault(ini_path);
     m2_ini_parse(ini_path, OnIniKV, NULL);
 }
 

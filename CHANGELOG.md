@@ -2,6 +2,14 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.1.5] - 2026-07-01
+
+### Added
+- **Self-healing `.ini` in all three mods.** Each `.asi` now writes a commented default `.ini` next to itself on first launch if none is present. Users can drop the `.asi` alone and get an editable, fully-annotated config without hunting down the accompanying file. Existing `.ini` files are never overwritten — the check is a plain `fopen("r")` first-pass. A `[*] <mod>: wrote default ...` line is emitted to the mod's log when the file is generated so the behavior is visible.
+
+### Removed
+- **`multiplayer-restore-DEV`: cert-blindfold and clock-spoof hooks.** Live testing on the current cracked binary confirmed the FESL CA pubkey patch alone is sufficient for the private server's cert chain to validate — the `WinVerifyTrust` return-`ERROR_SUCCESS` hook and the Win32/CRT clock spoof (pinning time to 2012-06-15) were experimentation-era belt-and-braces layers. Both are now gone, along with their `hook_cert`, `hook_time`, and `spoof_clock` INI keys, all associated typedefs / detour functions / static originals, and the `-lwintrust` link dependency. Binary size dropped ~2.5 KB. The DNS redirect (`hook_dns`), FESL CA key patch (`patch_ca`), and b-version patch (`patch_bversion` / `bversion`) are unchanged. A short "Historical note" paragraph was left in the source header explaining why the hooks aren't there anymore, so future contributors reading git blame have the context.
+
 ## [v0.1.4] - 2026-07-01
 
 ### Added
