@@ -10,7 +10,7 @@
       "name": "Lua Bridge (DEV)",
       "type": "asi",
       "description": "Exposes the game's internal Lua state over a localhost TCP port.",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "assets": ["lua_bridge_DEV.asi", "lua_bridge_DEV.ini", "lua_loader.ini", "lua_console.py"]
     },
     {

@@ -19,7 +19,21 @@ Registers a global `Tcp` namespace containing `Tcp.Send(host, port, msg)`.
 *   **ABI Hijack:** Implemented the custom calling convention of the game's `luaL_register` (`ECX = L`, `EAX = libname`, `[esp+4] = table`, caller cleans 4 bytes) using inline GCC assembly.
 *   **Localhost Security Restriction:** Enforces loopback-only connections (`127.0.0.0/8` IP space). Attempts to communicate with external hosts are blocked for security.
 
-### 3. Native Script Loader
+### 3. Global `Loader.*` Namespace
+Registers a `Loader` namespace with utility functions available to any script or REPL chunk. Registered via the same custom-ABI `luaL_register` path as `Tcp.Send`, and re-registered on every pump batch so `_G` wipes across game-state transitions don't strand the globals.
+
+*   **`Loader.Printf(msg, ...)`** — appends a line to `lua_loader_printf.log` next to the .asi. Low-noise alternative to the engine's `Debug.Printf`, which fires thousands of times per frame from stock scripts.
+*   **`Loader.GetKeyboardState()`** — 256-byte string, one byte per virtual-key code, high bit set iff currently pressed. Read with `string.byte(s, vk + 1)`. Uses `GetAsyncKeyState` (system-wide physical state), not the thread-message-queue-based Win32 `GetKeyboardState`.
+*   **`Loader.IsKeyDown(vk)`** — beginner-friendly single-key predicate. Returns a boolean. Wraps one `GetAsyncKeyState` call.
+*   **`Loader.PopKeyEvents()`** — returns a string of raw VK bytes (one byte per event, in press order) for every up→down edge observed since the last call. Filled by a dedicated ~60 Hz C-side sampler thread into a 128-slot ring buffer, so a poll-once-per-frame client never misses a keystroke to timing. Empty string when idle. **Focus-gated**: keystrokes are silently dropped when the game process is not the foreground window, so mods (co-op chat, rebind UIs, debug consoles) don't accidentally capture keystrokes typed into other apps.
+*   **`Loader.ClearKeyEvents()`** — drops every buffered event without returning them. Use as an explicit reset when opening a chat input or key-rebind capture.
+*   **`Loader.IsGameFocused()`** — returns a boolean; true iff the foreground window belongs to the game's process. Uses process-ID match so it works regardless of window style (borderless, fullscreen, multi-window).
+
+> [!IMPORTANT]
+> **Do not call `Loader.Printf` or `Tcp.Send` inside per-frame Lua loops.**  
+> Each `Loader.Printf` costs ~5 ms under Windows Defender (write-intercept scanning). Each `Tcp.Send` costs ~15 ms (localhost TCP handshake + TIME_WAIT). A `for i=1,60 do Loader.Printf(...) end` in a 60 FPS update loop will saturate the frame budget. Both are fine for occasional use — REPL results, one-shot HUD updates, event-triggered logging.
+
+### 4. Native Script Loader
 Recursively scans for and runs scripts dropped into three folders under `<game>/scripts/`:
 
 #### 📁 `scripts/OnBoot/`

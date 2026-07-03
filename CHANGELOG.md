@@ -2,6 +2,28 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.1.6] - 2026-07-03
+
+Only `lua-bridge-DEV` bumped this release (0.1.5 → 0.1.6). `debug-overlay-DEV` and `multiplayer-restore-DEV` stay at 0.1.5 — the modkit downloads each mod's assets from the release matching that mod's own `version` field, so leaving them alone is truthful and reflects that nothing about them changed.
+
+### Added (lua-bridge)
+
+Extensive `Loader.*` namespace additions turning the bridge into a full keyboard / focus API surface. Discovered adequate for co-op text chat via an adversarial capture test — see the notes at the bottom.
+
+- **`Loader.GetKeyboardState()`** — returns a 256-byte string; each byte's high bit is set iff the corresponding virtual-key code is currently pressed. Backed by `GetAsyncKeyState` (system-wide physical state, not thread-message-queue). Consume with `string.byte(s, vk + 1)`.
+- **`Loader.IsKeyDown(vk)`** — beginner-friendly single-key predicate. Boolean return.
+- **`Loader.PopKeyEvents()`** — press-order event queue. Backed by a dedicated **~60 Hz C-side sampler thread** and a **128-slot ring buffer**, so a poll-once-per-frame client never misses a keystroke to timing. Returns a string of raw VK bytes; empty when idle. **Focus-gated**: keystrokes typed while the game process is not the foreground window are silently dropped, so co-op chat mods don't accidentally capture Discord messages.
+- **`Loader.ClearKeyEvents()`** — explicit ring reset. Meant to be called at the moment a chat input opens so the first `PopKeyEvents()` after that returns only what the user typed *since*.
+- **`Loader.IsGameFocused()`** — boolean; true iff the foreground window belongs to the game process. Uses process-ID match so it works across window styles (borderless, fullscreen, multi-window).
+
+### Changed (lua-bridge)
+
+- **REPL rx buffer bumped 4 KB → 64 KB.** A Lua chunk with any single line longer than 4096 bytes silently wedged the receive loop (server `recv`'d 0 more bytes, then closed the connection). Found by the stress harness's big-chunk test. 64 KB comfortably covers realistic line lengths.
+
+### Notes for consumers
+
+- `Loader.Printf` and `Tcp.Send` are each **several milliseconds per call** (~5 ms and ~15 ms respectively — the former's cost is Windows Defender scanning `.log` writes, the latter's is localhost TCP handshake + `TIME_WAIT` per fresh socket). **Do not call inside per-frame Lua loops** — ~150/sec saturates a full 60 FPS frame. Both are fine for occasional use.
+
 ## [v0.1.5] - 2026-07-01
 
 ### Added

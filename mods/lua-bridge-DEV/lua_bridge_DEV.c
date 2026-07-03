@@ -326,6 +326,65 @@ static void InitChunkSource(void) {
     g_chunkSource.hash   = 0xDEADBEEF;
 }
 
+/* Fixed-size TString for Loader.GetKeyboardState()'s return value.
+ * 256 bytes, one per VK code; high bit set = currently pressed.
+ *
+ * Two documented caveats:
+ *   1. Static buffer, reused per call. `local a = Loader.GetKeyboardState();
+ *      Loader.GetKeyboardState()` — `a` now reflects the second call's
+ *      contents because both references point at this same struct.
+ *      Copy bytes out if you need to compare two snapshots.
+ *   2. Not interned with the engine's string table. `s == "..."` will
+ *      always be false regardless of content. Decode byte-wise with
+ *      string.byte(s, vk+1). */
+#pragma pack(push, 4)
+typedef struct KeyboardStateTString {
+    void*    next;
+    uint8_t  tt;
+    uint8_t  marked;
+    uint8_t  reserved;
+    uint8_t  _pad;
+    uint32_t hash;
+    uint32_t len;
+    char     data[256];
+} KeyboardStateTString;
+#pragma pack(pop)
+static KeyboardStateTString g_kbStateTString;
+
+static void InitKeyboardStateTString(void) {
+    memset(&g_kbStateTString, 0, sizeof(g_kbStateTString));
+    g_kbStateTString.tt     = (uint8_t)LUA_TSTRING;
+    g_kbStateTString.marked = 0x20 | 0x01;  /* FIXEDBIT | WHITE0BIT */
+    g_kbStateTString.hash   = 0x4B425953;    /* "KBYS" — arbitrary, unused unless interned */
+    g_kbStateTString.len    = 256;
+}
+
+/* Companion TString for Loader.PopKeyEvents(). Same buffer-reuse
+ * semantics as g_kbStateTString — the returned string is a private,
+ * per-call view; consume immediately, don't hold across another pop. */
+#define KEYEVENT_BUFFER_SIZE 128
+#pragma pack(push, 4)
+typedef struct KeyEventsTString {
+    void*    next;
+    uint8_t  tt;
+    uint8_t  marked;
+    uint8_t  reserved;
+    uint8_t  _pad;
+    uint32_t hash;
+    uint32_t len;
+    char     data[KEYEVENT_BUFFER_SIZE];
+} KeyEventsTString;
+#pragma pack(pop)
+static KeyEventsTString g_keyEventsTString;
+
+static void InitKeyEventsTString(void) {
+    memset(&g_keyEventsTString, 0, sizeof(g_keyEventsTString));
+    g_keyEventsTString.tt     = (uint8_t)LUA_TSTRING;
+    g_keyEventsTString.marked = 0x20 | 0x01;  /* FIXEDBIT | WHITE0BIT */
+    g_keyEventsTString.hash   = 0x45564553;   /* "EVES" */
+    g_keyEventsTString.len    = 0;
+}
+
 /* ------------------------------------------------------------------------ *
  * Globals
  * ------------------------------------------------------------------------ */
@@ -1210,6 +1269,95 @@ typedef struct {
 static LuaKeyScript g_KeyScripts[MAX_SCRIPTS];
 static int g_KeyScriptCount = 0;
 
+/* ------------------------------------------------------------------------ *
+ * Key-event ring buffer — feeds Loader.PopKeyEvents().
+ *
+ * LoaderKeyEventThread samples GetAsyncKeyState across all 256 VK codes at
+ * ~60 Hz, tracks per-key previous state, and appends the VK code to this
+ * ring on each up→down edge. LuaLoaderPopKeyEvents drains the ring into
+ * g_keyEventsTString and returns it to Lua as a string of raw VK bytes.
+ *
+ * Presses only (no release events). If a caller needs release edges,
+ * we'd extend the encoding (pair of bytes or a companion buffer) — held
+ * off for a first cut since chat / rebind / debug-console use cases only
+ * need presses.
+ *
+ * Ring overflow policy: drop oldest. 128 events between polls covers
+ * ~10 seconds of continuous 100 WPM typing; realistic clients poll much
+ * faster than that.
+ * ------------------------------------------------------------------------ */
+static CRITICAL_SECTION g_keyEventMtx;
+static int              g_keyEventMtxInit = 0;
+static uint8_t          g_keyEventRing[KEYEVENT_BUFFER_SIZE];
+static int              g_keyEventHead    = 0;   /* next write slot */
+static int              g_keyEventTail    = 0;   /* next read slot */
+static int              g_keyEventCount   = 0;   /* live events in ring */
+
+static void KeyEventsPush(uint8_t vk) {
+    if (!g_keyEventMtxInit) return;
+    EnterCriticalSection(&g_keyEventMtx);
+    g_keyEventRing[g_keyEventHead] = vk;
+    g_keyEventHead = (g_keyEventHead + 1) % KEYEVENT_BUFFER_SIZE;
+    if (g_keyEventCount < KEYEVENT_BUFFER_SIZE) {
+        g_keyEventCount++;
+    } else {
+        /* Full — advance tail to drop oldest. Head has already lapped it. */
+        g_keyEventTail = (g_keyEventTail + 1) % KEYEVENT_BUFFER_SIZE;
+    }
+    LeaveCriticalSection(&g_keyEventMtx);
+}
+
+static int KeyEventsPopAll(uint8_t* out, int max_out) {
+    int n = 0;
+    if (!g_keyEventMtxInit) return 0;
+    EnterCriticalSection(&g_keyEventMtx);
+    while (g_keyEventCount > 0 && n < max_out) {
+        out[n++] = g_keyEventRing[g_keyEventTail];
+        g_keyEventTail = (g_keyEventTail + 1) % KEYEVENT_BUFFER_SIZE;
+        g_keyEventCount--;
+    }
+    LeaveCriticalSection(&g_keyEventMtx);
+    return n;
+}
+
+/* Is the foreground window owned by our process? Uses process-ID match
+ * rather than window-class matching, so it works across any game version
+ * or multi-window layout without hardcoded strings. */
+static BOOL IsGameFocused(void) {
+    HWND fg;
+    DWORD fg_pid = 0;
+    fg = GetForegroundWindow();
+    if (!fg) return FALSE;
+    GetWindowThreadProcessId(fg, &fg_pid);
+    return fg_pid == GetCurrentProcessId();
+}
+
+static DWORD WINAPI LoaderKeyEventThread(LPVOID param) {
+    static uint8_t prev_down[256];
+    int vk;
+    (void)param;
+    memset(prev_down, 0, sizeof(prev_down));
+    for (;;) {
+        /* Sample state every tick regardless of focus so prev_down stays
+         * accurate. Only the push is focus-gated — this avoids ghost
+         * events when the user Alt+Tabs while holding a key: the sampler
+         * observes the eventual up→down while unfocused (no push), then
+         * the follow-on down→up on refocus is a real edge with fresh
+         * state. */
+        BOOL focused = IsGameFocused();
+        for (vk = 0; vk < 256; ++vk) {
+            SHORT s = GetAsyncKeyState(vk);
+            uint8_t is_down = (s & 0x8000) ? 1 : 0;
+            if (is_down && !prev_down[vk] && focused) {
+                KeyEventsPush((uint8_t)vk);
+            }
+            prev_down[vk] = is_down;
+        }
+        Sleep(16); /* ~60 Hz — 3–4× the highest realistic typing rate */
+    }
+    return 0;
+}
+
 static DWORD WINAPI LoaderKeyThread(LPVOID param) {
     (void)param;
     for (;;) {
@@ -1399,8 +1547,165 @@ static int LuaLoaderPrintf(void* L) {
     return 0;
 }
 
+/* ------------------------------------------------------------------------ *
+ * Loader.GetKeyboardState() — return a 256-byte string where byte[vk] has
+ * its high bit set iff virtual-key `vk` is currently pressed. Lua-side:
+ *   local s = Loader.GetKeyboardState()
+ *   if string.byte(s, VK_SHIFT + 1) >= 128 then ... end
+ *
+ * Uses GetAsyncKeyState (physical, system-wide) NOT Win32 GetKeyboardState
+ * (per-thread message-queue snapshot — would return stale/zero from the
+ * game thread). Same call LoaderKeyThread already trusts.
+ *
+ * Pushes the hand-crafted g_kbStateTString directly onto L->top and
+ * advances top by one TValue slot. Safe because the engine reserves at
+ * least LUA_MINSTACK slots for every C function frame. See the
+ * KeyboardStateTString definition for the buffer-reuse caveats.
+ * ------------------------------------------------------------------------ */
+static int LuaLoaderGetKeyboardState(void* L) {
+    char* Lc;
+    char* top;
+    int i;
+
+    if (!L || !LooksLikeLuaState(L)) return 0;
+
+    for (i = 0; i < 256; ++i) {
+        SHORT s = GetAsyncKeyState(i);
+        g_kbStateTString.data[i] = (s & 0x8000) ? (char)0x80 : (char)0x00;
+    }
+
+    Lc  = (char*)L;
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
+
+    *(void**)top                             = &g_kbStateTString;
+    *(int*)(top + TVALUE_TT_OFFSET)          = LUA_TSTRING;
+    *(char**)(Lc + LUA_OFF_TOP)              = top + TVALUE_SIZE;
+    return 1;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Loader.IsKeyDown(vk) — beginner-friendly single-key predicate.
+ * Lua-side:
+ *   if Loader.IsKeyDown(0x10) then ... end   -- Shift held?
+ *
+ * Same GetAsyncKeyState-based state as Loader.GetKeyboardState, just
+ * scoped to one VK code and returning a plain boolean. Cheaper if the
+ * caller only needs one key; also easier to teach.
+ * ------------------------------------------------------------------------ */
+static int LuaLoaderIsKeyDown(void* L) {
+    char* Lc;
+    char* base;
+    char* top;
+    int   vk;
+    SHORT ks;
+
+    if (!L || !LooksLikeLuaState(L)) return 0;
+    if (m2_lua_nargs(L) < 1) return 0;
+
+    Lc   = (char*)L;
+    base = *(char**)(Lc + LUA_OFF_BASE);
+    if (!base || !SafeProbe(base, TVALUE_SIZE)) return 0;
+    if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+
+    vk = (int)*(float*)base;  /* lua_Number = float in this build */
+    if (vk < 0 || vk > 255) return 0;
+
+    ks = GetAsyncKeyState(vk);
+
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
+
+    *(int*)top                       = (ks & 0x8000) ? 1 : 0;
+    *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TBOOLEAN;
+    *(char**)(Lc + LUA_OFF_TOP)      = top + TVALUE_SIZE;
+    return 1;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Loader.PopKeyEvents() — drain the C-side event ring into a string of
+ * raw VK codes (one byte per event), in press order. Empty string if
+ * nothing new since last call.
+ *
+ *   local events = Loader.PopKeyEvents()
+ *   for i=1,#events do
+ *       local vk = string.byte(events, i)
+ *       -- ...dispatch...
+ *   end
+ *
+ * The ring is filled by LoaderKeyEventThread at ~60 Hz across all 256
+ * VKs, so a poll-once-per-frame client never misses a keypress the way
+ * client-side edge detection on GetKeyboardState does.
+ * ------------------------------------------------------------------------ */
+static int LuaLoaderPopKeyEvents(void* L) {
+    char* Lc;
+    char* top;
+    int   n;
+
+    if (!L || !LooksLikeLuaState(L)) return 0;
+
+    n = KeyEventsPopAll((uint8_t*)g_keyEventsTString.data, KEYEVENT_BUFFER_SIZE);
+    g_keyEventsTString.len = (uint32_t)n;
+
+    Lc  = (char*)L;
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
+
+    *(void**)top                     = &g_keyEventsTString;
+    *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TSTRING;
+    *(char**)(Lc + LUA_OFF_TOP)      = top + TVALUE_SIZE;
+    return 1;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Loader.ClearKeyEvents() — drop every buffered event without returning
+ * them. Useful right when a chat input opens: call this once, then wait
+ * for the user to type, then PopKeyEvents(). Same effect as calling
+ * PopKeyEvents() and discarding the result — this just reads more
+ * clearly at the call site.
+ * ------------------------------------------------------------------------ */
+static int LuaLoaderClearKeyEvents(void* L) {
+    (void)L;
+    if (!g_keyEventMtxInit) return 0;
+    EnterCriticalSection(&g_keyEventMtx);
+    g_keyEventCount = 0;
+    g_keyEventHead  = 0;
+    g_keyEventTail  = 0;
+    LeaveCriticalSection(&g_keyEventMtx);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Loader.IsGameFocused() — is the foreground window owned by our
+ * process? True for any window belonging to the game (main or dialog);
+ * false when Alt+Tabbed to another app.
+ *
+ * PopKeyEvents already gates its captures on this internally. Exposed
+ * here so callers can gate their own logic (e.g. skip heavy work while
+ * backgrounded, or wrap raw IsKeyDown queries with focus-awareness).
+ * ------------------------------------------------------------------------ */
+static int LuaLoaderIsGameFocused(void* L) {
+    char* Lc;
+    char* top;
+    if (!L || !LooksLikeLuaState(L)) return 0;
+
+    Lc  = (char*)L;
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
+
+    *(int*)top                       = IsGameFocused() ? 1 : 0;
+    *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TBOOLEAN;
+    *(char**)(Lc + LUA_OFF_TOP)      = top + TVALUE_SIZE;
+    return 1;
+}
+
 static const luaL_Reg loader_lib[] = {
-    {"Printf", LuaLoaderPrintf},
+    {"Printf",           LuaLoaderPrintf},
+    {"GetKeyboardState", LuaLoaderGetKeyboardState},
+    {"IsKeyDown",        LuaLoaderIsKeyDown},
+    {"PopKeyEvents",     LuaLoaderPopKeyEvents},
+    {"ClearKeyEvents",   LuaLoaderClearKeyEvents},
+    {"IsGameFocused",    LuaLoaderIsGameFocused},
     {NULL, NULL}
 };
 
@@ -1471,7 +1776,10 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
     m2_logf("[*] lua_bridge: listening on %s:%d", g_repl_host, g_repl_port);
 
     for (;;) {
-        char rx[4096];
+        char rx[65536];  /* per-line receive buffer; a single line longer
+                          * than this wedges the recv loop (recv asks for
+                          * 0 more bytes and breaks). 64 KB comfortably
+                          * covers realistic Lua chunk lines. */
         char chunk_buf[1048576];  /* 1 MB — matches FixedTString.data */
         size_t chunk_len = 0;
         fd_set fds;
@@ -1655,7 +1963,11 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     }
     InitializeCriticalSection(&g_inMtx);
     InitializeCriticalSection(&g_outMtx);
+    InitializeCriticalSection(&g_keyEventMtx);
+    g_keyEventMtxInit = 1;
     InitChunkSource();
+    InitKeyboardStateTString();
+    InitKeyEventsTString();
     InitLoaderPrintfLog();
 
     mod = GetModuleHandleA(NULL);
@@ -1728,6 +2040,9 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     }
 
     CreateThread(NULL, 0, BridgeServerThread, NULL, 0, NULL);
+    CreateThread(NULL, 0, LoaderKeyEventThread, NULL, 0, NULL);
+    m2_logf("[*] lua_bridge: key-event sampler armed (~60 Hz, %d-slot ring)",
+            KEYEVENT_BUFFER_SIZE);
     return 0;
 }
 
