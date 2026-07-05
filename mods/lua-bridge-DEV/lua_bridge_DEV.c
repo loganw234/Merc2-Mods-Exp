@@ -59,6 +59,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "m2.h"
 
@@ -723,6 +724,8 @@ static void LuaDoString(void* L, const char* code, size_t code_len,
 
 static void RegisterTcpLib(void* L);
 static void RegisterLoaderLib(void* L);
+static void RegisterMathLib(void* L);
+static void RunPolyfill(void* L);
 static void ExecuteLuaFolder(void* L, const char* folder_name);
 static void InitializeKeyScripts(void);
 
@@ -745,6 +748,8 @@ static void PumpQueue(void* L_for_exec) {
     if (L_ok) {
         RegisterTcpLib(L_for_exec);
         RegisterLoaderLib(L_for_exec);
+        RegisterMathLib(L_for_exec);
+        RunPolyfill(L_for_exec);
     }
 
     for (;;) {
@@ -815,6 +820,8 @@ static void CaptureL(void* L, const char* via) {
     m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
     RegisterTcpLib(L);
     RegisterLoaderLib(L);
+    RegisterMathLib(L);
+    RunPolyfill(L);
 
     if (g_loader_enabled) {
         static int key_loader_initialized = 0;
@@ -1221,6 +1228,8 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
      * PumpQueue: engine may have wiped _G between capture and now. */
     RegisterTcpLib(L);
     RegisterLoaderLib(L);
+    RegisterMathLib(L);
+    RunPolyfill(L);
 
     for (i = 0; i < script_count; ++i) {
         FILE* f = fopen(scripts[i].path, "rb");
@@ -1369,7 +1378,21 @@ static DWORD WINAPI LoaderKeyThread(LPVOID param) {
                 if (is_down) {
                     if (!g_KeyScripts[i].was_down) {
                         g_KeyScripts[i].was_down = 1;
-                        
+
+                        /* Explicit existence check before fopen. If the .lua
+                         * file was deleted after boot (or the ini has a stale
+                         * mapping to something that never existed), skip
+                         * cleanly rather than proceeding down the read+queue
+                         * path — reports have shown that path can destabilize
+                         * the game when the file is gone. */
+                        DWORD attrs = GetFileAttributesA(g_KeyScripts[i].path);
+                        if (attrs == INVALID_FILE_ATTRIBUTES ||
+                            (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                            m2_logf("[!] lua_bridge: OnKey '%s' bound to missing file: %s (skipped)",
+                                    g_KeyScripts[i].key_name, g_KeyScripts[i].rel_path);
+                            continue;
+                        }
+
                         // Load script file and queue it
                         FILE* f = fopen(g_KeyScripts[i].path, "rb");
                         if (f) {
@@ -1726,6 +1749,276 @@ static void RegisterLoaderLib(void* L) {
     );
     static int logged = 0;
     if (!logged) { logged = 1; m2_logf("[*] lua_bridge: Registered Loader.Printf globally"); }
+}
+
+/* ------------------------------------------------------------------------ *
+ * math.* — Pandemic's stripped Lua build is missing most of the trig,
+ * log, and random helpers a modern script (or an AI-assisted one) will
+ * reach for. This section registers real single-precision math functions
+ * so scripts can call math.sin, math.sqrt, math.random, etc. natively
+ * instead of re-implementing them via Taylor series.
+ *
+ * The engine's luaL_register reuses the existing `math` global table
+ * (Pandemic kept the table — just without most entries), so what's here
+ * is additive: math.floor / math.abs / math.max / math.min / etc. that
+ * the engine already ships stay untouched. See stdlib_report.txt in the
+ * stress harness scratchpad for the full present/missing enumeration
+ * that motivated each entry.
+ * ------------------------------------------------------------------------ */
+
+/* One-arg → one-return single-precision math wrapper. Same shape as the
+ * hand-written prototypes above, minus the copy-paste. All safety checks
+ * (L validation, arg count, type tag, top/base bounds via SafeProbe) are
+ * preserved — this is a naming shortcut, not a check shortcut. */
+#define MATH_ONEARG(fn_name, cfunc)                                          \
+    static int LuaMath##fn_name(void* L) {                                    \
+        char* Lc; char* base; char* top; float x;                             \
+        if (!L || !LooksLikeLuaState(L)) return 0;                            \
+        if (m2_lua_nargs(L) < 1) return 0;                                    \
+        Lc   = (char*)L;                                                      \
+        base = *(char**)(Lc + LUA_OFF_BASE);                                  \
+        if (!base || !SafeProbe(base, TVALUE_SIZE)) return 0;                 \
+        if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;        \
+        x = *(float*)base;                                                    \
+        top = *(char**)(Lc + LUA_OFF_TOP);                                    \
+        if (!SafeProbe(top, TVALUE_SIZE)) return 0;                           \
+        *(float*)top                    = (float)cfunc(x);                    \
+        *(int*)(top + TVALUE_TT_OFFSET) = LUA_TNUMBER;                        \
+        *(char**)(Lc + LUA_OFF_TOP)     = top + TVALUE_SIZE;                  \
+        return 1;                                                             \
+    }
+
+/* Two-arg → one-return single-precision math wrapper. */
+#define MATH_TWOARG(fn_name, cfunc)                                          \
+    static int LuaMath##fn_name(void* L) {                                    \
+        char* Lc; char* base; char* top; float x, y;                          \
+        if (!L || !LooksLikeLuaState(L)) return 0;                            \
+        if (m2_lua_nargs(L) < 2) return 0;                                    \
+        Lc   = (char*)L;                                                      \
+        base = *(char**)(Lc + LUA_OFF_BASE);                                  \
+        if (!base || !SafeProbe(base, TVALUE_SIZE * 2)) return 0;             \
+        if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;        \
+        if (*(int*)(base + TVALUE_SIZE + TVALUE_TT_OFFSET) != LUA_TNUMBER)    \
+            return 0;                                                         \
+        x = *(float*)base;                                                    \
+        y = *(float*)(base + TVALUE_SIZE);                                    \
+        top = *(char**)(Lc + LUA_OFF_TOP);                                    \
+        if (!SafeProbe(top, TVALUE_SIZE)) return 0;                           \
+        *(float*)top                    = (float)cfunc(x, y);                 \
+        *(int*)(top + TVALUE_TT_OFFSET) = LUA_TNUMBER;                        \
+        *(char**)(Lc + LUA_OFF_TOP)     = top + TVALUE_SIZE;                  \
+        return 1;                                                             \
+    }
+
+MATH_ONEARG(Sin,   sinf)
+MATH_ONEARG(Cos,   cosf)
+MATH_ONEARG(Tan,   tanf)
+MATH_ONEARG(Asin,  asinf)
+MATH_ONEARG(Acos,  acosf)
+MATH_ONEARG(Atan,  atanf)
+MATH_ONEARG(Sinh,  sinhf)
+MATH_ONEARG(Cosh,  coshf)
+MATH_ONEARG(Tanh,  tanhf)
+MATH_ONEARG(Sqrt,  sqrtf)
+MATH_ONEARG(Log,   logf)
+MATH_ONEARG(Log10, log10f)
+
+MATH_TWOARG(Atan2, atan2f)
+MATH_TWOARG(Fmod,  fmodf)
+
+/* ldexp(x, e) — e is naturally an int; Lua passes a number, cast internally. */
+static int LuaMathLdexp(void* L) {
+    char* Lc; char* base; char* top; float x; int e;
+    if (!L || !LooksLikeLuaState(L)) return 0;
+    if (m2_lua_nargs(L) < 2) return 0;
+    Lc   = (char*)L;
+    base = *(char**)(Lc + LUA_OFF_BASE);
+    if (!base || !SafeProbe(base, TVALUE_SIZE * 2)) return 0;
+    if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+    if (*(int*)(base + TVALUE_SIZE + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+    x = *(float*)base;
+    e = (int)*(float*)(base + TVALUE_SIZE);
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
+    *(float*)top                    = ldexpf(x, e);
+    *(int*)(top + TVALUE_TT_OFFSET) = LUA_TNUMBER;
+    *(char**)(Lc + LUA_OFF_TOP)     = top + TVALUE_SIZE;
+    return 1;
+}
+
+/* modf(x) → integer_part, fractional_part. Two-return. */
+static int LuaMathModf(void* L) {
+    char* Lc; char* base; char* top; float x, ipart, fpart;
+    if (!L || !LooksLikeLuaState(L)) return 0;
+    if (m2_lua_nargs(L) < 1) return 0;
+    Lc   = (char*)L;
+    base = *(char**)(Lc + LUA_OFF_BASE);
+    if (!base || !SafeProbe(base, TVALUE_SIZE)) return 0;
+    if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+    x = *(float*)base;
+    fpart = modff(x, &ipart);
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    if (!SafeProbe(top, TVALUE_SIZE * 2)) return 0;
+    *(float*)top                                     = ipart;
+    *(int*)(top + TVALUE_TT_OFFSET)                  = LUA_TNUMBER;
+    *(float*)(top + TVALUE_SIZE)                     = fpart;
+    *(int*)(top + TVALUE_SIZE + TVALUE_TT_OFFSET)    = LUA_TNUMBER;
+    *(char**)(Lc + LUA_OFF_TOP)                      = top + TVALUE_SIZE * 2;
+    return 2;
+}
+
+/* frexp(x) → mantissa, exponent. Two-return. */
+static int LuaMathFrexp(void* L) {
+    char* Lc; char* base; char* top; float x, mant; int expo;
+    if (!L || !LooksLikeLuaState(L)) return 0;
+    if (m2_lua_nargs(L) < 1) return 0;
+    Lc   = (char*)L;
+    base = *(char**)(Lc + LUA_OFF_BASE);
+    if (!base || !SafeProbe(base, TVALUE_SIZE)) return 0;
+    if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+    x = *(float*)base;
+    mant = frexpf(x, &expo);
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    if (!SafeProbe(top, TVALUE_SIZE * 2)) return 0;
+    *(float*)top                                     = mant;
+    *(int*)(top + TVALUE_TT_OFFSET)                  = LUA_TNUMBER;
+    *(float*)(top + TVALUE_SIZE)                     = (float)expo;
+    *(int*)(top + TVALUE_SIZE + TVALUE_TT_OFFSET)    = LUA_TNUMBER;
+    *(char**)(Lc + LUA_OFF_TOP)                      = top + TVALUE_SIZE * 2;
+    return 2;
+}
+
+/* random() → float 0..1
+ * random(n) → int 1..n
+ * random(m, n) → int m..n
+ * Matches stock Lua 5.1 semantics, backed by CRT rand(). */
+static int LuaMathRandom(void* L) {
+    char* Lc; char* base; char* top;
+    int nargs;
+    float result;
+
+    if (!L || !LooksLikeLuaState(L)) return 0;
+    nargs = m2_lua_nargs(L);
+    Lc   = (char*)L;
+    base = *(char**)(Lc + LUA_OFF_BASE);
+
+    if (nargs == 0) {
+        result = (float)rand() / (float)RAND_MAX;
+    } else if (nargs == 1) {
+        int upper;
+        if (!base || !SafeProbe(base, TVALUE_SIZE)) return 0;
+        if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+        upper = (int)*(float*)base;
+        if (upper < 1) return 0;
+        result = (float)(1 + rand() % upper);
+    } else {
+        int lo, hi;
+        if (!base || !SafeProbe(base, TVALUE_SIZE * 2)) return 0;
+        if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+        if (*(int*)(base + TVALUE_SIZE + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+        lo = (int)*(float*)base;
+        hi = (int)*(float*)(base + TVALUE_SIZE);
+        if (hi < lo) return 0;
+        result = (float)(lo + rand() % (hi - lo + 1));
+    }
+
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
+    *(float*)top                    = result;
+    *(int*)(top + TVALUE_TT_OFFSET) = LUA_TNUMBER;
+    *(char**)(Lc + LUA_OFF_TOP)     = top + TVALUE_SIZE;
+    return 1;
+}
+
+/* randomseed(x) → seed the CRT rand() from a number. No return. */
+static int LuaMathRandomseed(void* L) {
+    char* base;
+    if (!L || !LooksLikeLuaState(L)) return 0;
+    if (m2_lua_nargs(L) < 1) return 0;
+    base = *(char**)((char*)L + LUA_OFF_BASE);
+    if (!base || !SafeProbe(base, TVALUE_SIZE)) return 0;
+    if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
+    srand((unsigned int)*(float*)base);
+    return 0;
+}
+
+static const luaL_Reg math_lib[] = {
+    {"sin",        LuaMathSin},
+    {"cos",        LuaMathCos},
+    {"tan",        LuaMathTan},
+    {"asin",       LuaMathAsin},
+    {"acos",       LuaMathAcos},
+    {"atan",       LuaMathAtan},
+    {"atan2",      LuaMathAtan2},
+    {"sinh",       LuaMathSinh},
+    {"cosh",       LuaMathCosh},
+    {"tanh",       LuaMathTanh},
+    {"sqrt",       LuaMathSqrt},
+    {"log",        LuaMathLog},
+    {"log10",      LuaMathLog10},
+    {"fmod",       LuaMathFmod},
+    {"ldexp",      LuaMathLdexp},
+    {"modf",       LuaMathModf},
+    {"frexp",      LuaMathFrexp},
+    {"random",     LuaMathRandom},
+    {"randomseed", LuaMathRandomseed},
+    {NULL, NULL}
+};
+
+static void RegisterMathLib(void* L) {
+    HMODULE base = GetModuleHandleA(NULL);
+    if (!base) return;
+    DWORD func_addr = (DWORD)base + g_rvas->luaL_register;
+    const char* libname = "math";
+    const luaL_Reg* table = math_lib;
+
+    __asm__ volatile (
+        "push %2\n\t"
+        "call *%3\n\t"
+        "add $4, %%esp\n\t"
+        :
+        : "c"(L), "a"(libname), "r"(table), "r"(func_addr)
+        : "edx", "memory"
+    );
+    static int logged = 0;
+    if (!logged) { logged = 1; m2_logf("[*] lua_bridge: Registered 19 math.* functions globally"); }
+}
+
+/* ------------------------------------------------------------------------ *
+ * Polyfill — Lua-side patch for the two things luaL_register can't give
+ * us: constants (math.pi, math.huge) and the missing base function
+ * assert. Runs as a small Lua chunk right after RegisterMathLib in every
+ * place the register calls happen, so a _G wipe recovers both the
+ * functions AND these polyfills on the next pump batch.
+ *
+ * Idempotent (each define is `if not ... then ... end`), so the cost of
+ * running it twice is a compile+pcall of a tiny chunk (~150 µs); at the
+ * measured 113 pumps/sec stress ceiling that's ~2% CPU. At realistic
+ * REPL rates (<10 pumps/sec) it's negligible.
+ * ------------------------------------------------------------------------ */
+static const char kPolyfillChunk[] =
+    "if math then "
+    "  if not math.pi   then math.pi   = 3.14159265358979323846 end "
+    "  if not math.huge then math.huge = 1e308 end "
+    "end "
+    "if not _G.assert then "
+    "  _G.assert = function(v, msg) "
+    "    if not v then error(msg or 'assertion failed!') end "
+    "    return v "
+    "  end "
+    "end";
+
+static void RunPolyfill(void* L) {
+    char buf[512];
+    if (!L || !LooksLikeLuaState(L)) return;
+    /* No t_inBridgeExec guard here — callers that need re-entry safety
+     * (PumpQueue) sit around this, but the polyfill itself is a leaf
+     * LuaDoString that saves/restores top+base cleanly. Nesting a leaf
+     * inside PumpQueue's LuaDoString would be a problem, but we run it
+     * BEFORE the user-chunk LuaDoString, so no nesting. */
+    LuaDoString(L, kPolyfillChunk, sizeof(kPolyfillChunk) - 1, buf, sizeof(buf));
+    static int logged = 0;
+    if (!logged) { logged = 1; m2_logf("[*] lua_bridge: polyfill applied (math.pi, math.huge, assert)"); }
 }
 
 /* ------------------------------------------------------------------------ *

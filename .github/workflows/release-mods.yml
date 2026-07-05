@@ -43,25 +43,25 @@ jobs:
           cp mods/multiplayer-restore-DEV/multiplayer_restore_DEV.ini dist/
           zip -j dist/multiplayer-restore-DEV.zip dist/multiplayer_restore_DEV.asi dist/multiplayer_restore_DEV.ini
           
-          # Stage and package lua-bridge with its folders
-          mkdir -p dist/lua-bridge-pkg/OnBoot
-          mkdir -p dist/lua-bridge-pkg/OnLoad
-          mkdir -p dist/lua-bridge-pkg/OnKey
-          
+          # Stage and package lua-bridge. IMPORTANT: no OnBoot/OnLoad/OnKey
+          # subfolders in the packaged zip. If the modkit's update logic
+          # nukes-and-reinstalls (rather than diff-and-patches), any
+          # user-authored scripts sharing those folders would be wiped
+          # along with our samples. Shipping only the four core files
+          # sidesteps that entirely. The sample .lua files remain in the
+          # repo as documentation — users copy them by hand if wanted.
+          mkdir -p dist/lua-bridge-pkg
+
           cp mods/lua-bridge-DEV/lua_bridge_DEV.asi dist/
           cp mods/lua-bridge-DEV/lua_bridge_DEV.ini dist/
           cp mods/lua-bridge-DEV/lua_loader.ini dist/
           cp mods/lua-bridge-DEV/lua_console.py dist/
-          
+
           cp mods/lua-bridge-DEV/lua_bridge_DEV.asi dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/lua_bridge_DEV.ini dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/lua_loader.ini dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/lua_console.py dist/lua-bridge-pkg/
-          cp mods/lua-bridge-DEV/scripts/OnBoot/print_boot.lua dist/lua-bridge-pkg/OnBoot/
-          cp mods/lua-bridge-DEV/scripts/OnLoad/print_load.lua dist/lua-bridge-pkg/OnLoad/
-          cp mods/lua-bridge-DEV/scripts/OnKey/test_key.lua dist/lua-bridge-pkg/OnKey/
-          cp mods/lua-bridge-DEV/scripts/OnKey/perf_monitor.lua dist/lua-bridge-pkg/OnKey/
-          
+
           cd dist/lua-bridge-pkg
           zip -r ../lua-bridge-DEV.zip .
           cd ../..

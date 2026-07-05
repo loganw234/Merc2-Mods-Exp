@@ -4,6 +4,10 @@ Exposes Mercenaries 2's statically-linked Lua 5.1.2 runtime via a localhost TCP 
 
 Ported from [loganw234/Mercenaries2](https://github.com/loganw234/Mercenaries2) to the [mercs2-qol-mods SDK](https://github.com/Mercenaries-Fan-Build/mercs2-qol-mods).
 
+> [!TIP]
+> **Ready-to-drop script samples, per-function reference docs, and deep-dive tutorials all live on the wiki: [wiki.mercs2.tools](https://wiki.mercs2.tools).**
+> The mod ships with the runtime only — no sample `.lua` files in the zip (so an auto-updater can't wipe your custom scripts alongside ours). Grab any samples you want from the wiki.
+
 > [!NOTE]
 > Tested and verified working against **`v0.2.0` of the `pmc_bb.dll` loader** (the Mercenaries Fan Build loader).
 
@@ -34,7 +38,7 @@ Registers a `Loader` namespace with utility functions available to any script or
 > Each `Loader.Printf` costs ~5 ms under Windows Defender (write-intercept scanning). Each `Tcp.Send` costs ~15 ms (localhost TCP handshake + TIME_WAIT). A `for i=1,60 do Loader.Printf(...) end` in a 60 FPS update loop will saturate the frame budget. Both are fine for occasional use — REPL results, one-shot HUD updates, event-triggered logging.
 
 ### 4. Native Script Loader
-Recursively scans for and runs scripts dropped into three folders under `<game>/scripts/`:
+Recursively scans for and runs scripts dropped into three folders under `<game>/scripts/`. **Sample scripts and pattern references are on the wiki at [wiki.mercs2.tools](https://wiki.mercs2.tools).**
 
 #### 📁 `scripts/OnBoot/`
 *   Executed immediately on the main thread when a valid Lua state (`L`) is first captured.

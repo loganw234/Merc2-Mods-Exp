@@ -5,6 +5,9 @@
 
 A collection of experimental mods for **Mercenaries 2: World in Flames** (PC).
 
+> [!TIP]
+> **Docs, tutorials, and script samples live on the wiki: [wiki.mercs2.tools](https://wiki.mercs2.tools)** — check there first for how to write, install, and troubleshoot mods.
+
 ## Connecting to the Modkit
 
 This repository supports live updates directly through the [Modkit](https://github.com/Mercenaries-Fan-Build/mercs2-modkit). This is the preferred method for acquiring and updating these experimental mods:

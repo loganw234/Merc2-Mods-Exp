@@ -2,6 +2,39 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.2.0] - 2026-07-05
+
+Only `lua-bridge-DEV` bumped this release (0.1.6 → 0.2.0). The version-family jump (0.1.x → 0.2.x) reflects that the Lua environment inside the game has grown from "a bridge you can send chunks to" into a **usable general-purpose Lua runtime**. AI-assisted script authors can now reach for `math.sqrt`, `math.pi`, `assert(x, msg)`, `math.random`, etc. and have them just work — the stripped stdlib is no longer a papercut on every fresh script.
+
+`debug-overlay-DEV` and `multiplayer-restore-DEV` stay at 0.1.5. Both are stable; nothing about them changed.
+
+### Added
+
+**Full Lua stdlib parity for math and assert** — a stdlib-completeness probe (run against the live game) identified 19 missing math functions and one critical missing base function. All are now available:
+
+- **`math.sin`, `math.cos`, `math.tan`** — trig (`sin`/`cos` shipped in v0.1.6; `tan` new here)
+- **`math.asin`, `math.acos`, `math.atan`, `math.atan2`** — inverse trig
+- **`math.sinh`, `math.cosh`, `math.tanh`** — hyperbolic
+- **`math.sqrt`, `math.log`, `math.log10`** — the ones AI-generated scripts reach for constantly
+- **`math.fmod`, `math.ldexp`, `math.modf`, `math.frexp`** — the low-level number-manipulation set
+- **`math.random(...)`, `math.randomseed(x)`** — matches stock Lua 5.1 semantics (`random()` / `random(n)` / `random(m, n)` all supported)
+- **`math.pi`, `math.huge`** — constants, injected via a Lua polyfill chunk since `luaL_register` only takes functions
+- **`assert(v, msg)`** — polyfilled in Lua on top of the engine's existing `error`. Idempotent (`if not _G.assert then`), re-applied on every pump batch so `_G` wipes don't strand it
+
+All backed by the C stdlib's single-precision routines with the same `SafeProbe` + type-tag safety wrapping used across the rest of the file. Registered via the custom-ABI `luaL_register` path, additive to the engine's existing `math.floor` / `math.abs` / `math.max` / `math.min` / etc.
+
+### Fixed
+
+**`LoaderKeyThread` file-exists guard.** Pressing a hotkey whose backing `.lua` file had been deleted after game boot could destabilize the game. `GetFileAttributesA` now runs before every `fopen`; missing files log a clear warning line (`[!] lua_bridge: OnKey '<key>' bound to missing file: <name> (skipped)`) and are safely skipped.
+
+### Changed
+
+**Release workflow no longer ships sample scripts in the packaged zip.** When a user updates the mod through the modkit and the modkit's update logic does a clean-and-reinstall (as opposed to a diff-and-patch), any user-authored `.lua` files sharing the same `OnBoot/`, `OnLoad/`, `OnKey/` folders as our samples get wiped alongside them. Stripping the samples from the auto-deployed zip sidesteps that entirely — nothing in those folders belongs to the mod's install list, so the modkit has no reason to touch them. Sample `.lua` files stay in the repo as documentation.
+
+### Documentation
+
+- Wiki pointer ([wiki.mercs2.tools](https://wiki.mercs2.tools)) added to the top-level README and to the lua-bridge README (twice — intro callout and inside the Script Loader section). Users looking for sample scripts, deep-dives, and per-function reference now have one authoritative destination.
+
 ## [v0.1.6] - 2026-07-03
 
 Only `lua-bridge-DEV` bumped this release (0.1.5 → 0.1.6). `debug-overlay-DEV` and `multiplayer-restore-DEV` stay at 0.1.5 — the modkit downloads each mod's assets from the release matching that mod's own `version` field, so leaving them alone is truthful and reflects that nothing about them changed.
