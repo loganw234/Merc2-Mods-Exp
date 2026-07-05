@@ -446,6 +446,7 @@ static int   g_loader_enabled  = 1;
 static int   g_loader_onboot   = 1;
 static int   g_loader_onload   = 1;
 static int   g_loader_delay_ms = 50;
+static int   g_loader_onkey_cooldown_ms = 250;  /* per-script re-fire lockout */
 
 /* ------------------------------------------------------------------------ *
  * Output-buffer helpers
@@ -1268,11 +1269,13 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
 }
 
 typedef struct {
-    char path[MAX_PATH];
-    char rel_path[MAX_PATH];
-    char key_name[64];
-    int vk_code;
-    int was_down;
+    char  path[MAX_PATH];
+    char  rel_path[MAX_PATH];
+    char  key_name[64];
+    int   vk_code;
+    int   was_down;
+    DWORD last_fired_tick;   /* GetTickCount() at last successful queue-push */
+    int   throttle_logged;   /* First cooldown throttle for this script logged? */
 } LuaKeyScript;
 
 static LuaKeyScript g_KeyScripts[MAX_SCRIPTS];
@@ -1379,6 +1382,34 @@ static DWORD WINAPI LoaderKeyThread(LPVOID param) {
                     if (!g_KeyScripts[i].was_down) {
                         g_KeyScripts[i].was_down = 1;
 
+                        /* Per-script cooldown gate. If the same script fires
+                         * again inside `loader_onkey_cooldown_ms` of its last
+                         * queue-push, skip. Purpose: keep non-reentrant
+                         * gameplay scripts (menus, cheats that mutate engine
+                         * state) safe from human hammer-tapping the hotkey.
+                         * DWORD subtraction handles GetTickCount wrap
+                         * correctly (~49.7-day cycle). Log the first throttle
+                         * per script per session so users learn about it,
+                         * then stay silent to avoid log spam. */
+                        if (g_loader_onkey_cooldown_ms > 0 &&
+                            g_KeyScripts[i].last_fired_tick != 0) {
+                            DWORD now     = GetTickCount();
+                            DWORD elapsed = now - g_KeyScripts[i].last_fired_tick;
+                            if (elapsed < (DWORD)g_loader_onkey_cooldown_ms) {
+                                if (!g_KeyScripts[i].throttle_logged) {
+                                    g_KeyScripts[i].throttle_logged = 1;
+                                    m2_logf("[!] lua_bridge: OnKey '%s' throttled (%s "
+                                            "re-fired %lu ms after last press; cooldown = %d ms). "
+                                            "Further throttles on this script this session will be silent.",
+                                            g_KeyScripts[i].key_name,
+                                            g_KeyScripts[i].rel_path,
+                                            (unsigned long)elapsed,
+                                            g_loader_onkey_cooldown_ms);
+                                }
+                                continue;
+                            }
+                        }
+
                         /* Explicit existence check before fopen. If the .lua
                          * file was deleted after boot (or the ini has a stale
                          * mapping to something that never existed), skip
@@ -1392,6 +1423,8 @@ static DWORD WINAPI LoaderKeyThread(LPVOID param) {
                                     g_KeyScripts[i].key_name, g_KeyScripts[i].rel_path);
                             continue;
                         }
+
+                        g_KeyScripts[i].last_fired_tick = GetTickCount();
 
                         // Load script file and queue it
                         FILE* f = fopen(g_KeyScripts[i].path, "rb");
@@ -2003,7 +2036,10 @@ static const char kPolyfillChunk[] =
     "end "
     "if not _G.assert then "
     "  _G.assert = function(v, msg) "
-    "    if not v then error(msg or 'assertion failed!') end "
+    /* level=2 skips the assert function frame so the error message
+     * points at the caller of assert (matching stock Lua semantics),
+     * not at this polyfill chunk. Critical for debuggable script code. */
+    "    if not v then error(msg or 'assertion failed!', 2) end "
     "    return v "
     "  end "
     "end";
@@ -2016,9 +2052,31 @@ static void RunPolyfill(void* L) {
      * LuaDoString that saves/restores top+base cleanly. Nesting a leaf
      * inside PumpQueue's LuaDoString would be a problem, but we run it
      * BEFORE the user-chunk LuaDoString, so no nesting. */
+    buf[0] = '\0';
     LuaDoString(L, kPolyfillChunk, sizeof(kPolyfillChunk) - 1, buf, sizeof(buf));
-    static int logged = 0;
-    if (!logged) { logged = 1; m2_logf("[*] lua_bridge: polyfill applied (math.pi, math.huge, assert)"); }
+
+    /* Log honestly on first run: LuaDoString writes "[compile] ..." for
+     * compile errors and "[bridge] ..." for internal LuaDoString bail-outs
+     * (empty chunk, bad L, etc). Either at buf[0] means the polyfill
+     * silently didn't apply, and shipping a broken chunk with a "polyfill
+     * applied" log line is exactly the kind of silent failure that hides
+     * bugs from the next contributor. Note: "[runtime]" on success is
+     * expected (Pandemic's pcall leaves stack junk in slot 0), so we do
+     * NOT treat it as failure — genuine runtime errors would show up in
+     * dev testing when the buggy chunk is first written. */
+    int failed = (strncmp(buf, "[compile]", 9) == 0)
+              || (strncmp(buf, "[bridge]",  8) == 0);
+    static int logged_ok = 0;
+    static int logged_fail = 0;
+    if (failed) {
+        if (!logged_fail) {
+            logged_fail = 1;
+            m2_logf("[!] lua_bridge: polyfill FAILED to apply: %s", buf);
+        }
+    } else if (!logged_ok) {
+        logged_ok = 1;
+        m2_logf("[*] lua_bridge: polyfill applied (math.pi, math.huge, assert)");
+    }
 }
 
 /* ------------------------------------------------------------------------ *
@@ -2181,6 +2239,9 @@ static void OnIniKV(void* ud, const char* key, const char* value) {
     } else if (_stricmp(key, "loader_delay_ms") == 0) {
         g_loader_delay_ms = atoi(value);
         if (g_loader_delay_ms < 0) g_loader_delay_ms = 0;
+    } else if (_stricmp(key, "loader_onkey_cooldown_ms") == 0) {
+        g_loader_onkey_cooldown_ms = atoi(value);
+        if (g_loader_onkey_cooldown_ms < 0) g_loader_onkey_cooldown_ms = 0;
     }
 }
 
@@ -2211,7 +2272,15 @@ static const char kDefaultIni[] =
     "loader_onload = 1\n"
     "\n"
     "; Delay (in milliseconds) between executing consecutive scripts\n"
-    "loader_delay_ms = 50\n";
+    "loader_delay_ms = 50\n"
+    "\n"
+    "; Minimum time (in milliseconds) between the SAME OnKey script re-firing.\n"
+    "; Prevents human hammer-tapping the hotkey from queueing multiple back-to-back\n"
+    "; runs of the same script, which can crash non-reentrant scripts (menus,\n"
+    "; state-mutating cheats, etc). First throttle per script is logged so users\n"
+    "; can see it kick in; subsequent throttles are silent to avoid log spam.\n"
+    "; Set to 0 to disable the cooldown entirely.\n"
+    "loader_onkey_cooldown_ms = 250\n";
 
 static void EnsureIniDefault(const char* path) {
     FILE* f = fopen(path, "r");

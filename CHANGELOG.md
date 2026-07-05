@@ -2,6 +2,23 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.2.1] - 2026-07-05
+
+Only `lua-bridge-DEV` bumped (0.2.0 → 0.2.1). Stability / correctness patch focused on OnKey reentrancy protection and two small polyfill nits caught in the v0.2.0 code review.
+
+### Added
+
+- **Per-script OnKey cooldown.** Rapid double-presses of the same hotkey were queueing two back-to-back runs of a script; sequential (not concurrent) execution, but many gameplay scripts aren't reentrant and the second run running on state the first left behind could destabilize the engine. `LoaderKeyThread` now tracks `last_fired_tick` per script and skips re-firing if the last fire was within `loader_onkey_cooldown_ms` (default **250 ms**). The first throttle per script per session logs `[!] lua_bridge: OnKey '<key>' throttled (...)` so users notice the cooldown is engaging; subsequent throttles are silent to avoid log spam. Set `loader_onkey_cooldown_ms = 0` in `lua_bridge_DEV.ini` to disable. Fully compatible with `GetTickCount` wraparound (~49.7-day cycle) via unsigned subtraction.
+
+### Fixed
+
+- **`assert` error message location.** The polyfill's `error(msg or 'assertion failed!')` used the default level (1), which pointed error messages at the polyfill chunk (`[string "if math then..."]:1: bad msg`) instead of at the caller of `assert(...)`. Now uses `error(..., 2)` to skip the assert function frame — error messages now report the caller's location, matching stock Lua semantics. Critical for anyone debugging scripts with real error messages.
+- **Polyfill success log is honest.** Previously logged `[*] polyfill applied ...` unconditionally, even if `LuaDoString` returned a compile error or internal bridge failure. Now checks the result buffer for `[compile]` or `[bridge]` prefixes and logs `[!] polyfill FAILED to apply: ...` in those cases. Prevents future silent breakage from hiding behind a misleading success line.
+
+### Notes
+
+`lua_loader.ini` still does not auto-prune stale script entries when the corresponding `.lua` file is deleted — this remains intentional (a moved `.lua` returning to its folder should keep its binding). If a specific user report shows the ini growing unmanageable, we'll add an opt-in `loader_prune_stale_ini` flag then.
+
 ## [v0.2.0] - 2026-07-05
 
 Only `lua-bridge-DEV` bumped this release (0.1.6 → 0.2.0). The version-family jump (0.1.x → 0.2.x) reflects that the Lua environment inside the game has grown from "a bridge you can send chunks to" into a **usable general-purpose Lua runtime**. AI-assisted script authors can now reach for `math.sqrt`, `math.pi`, `assert(x, msg)`, `math.random`, etc. and have them just work — the stripped stdlib is no longer a papercut on every fresh script.
