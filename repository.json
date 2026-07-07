@@ -10,7 +10,7 @@
       "name": "Lua Bridge (DEV)",
       "type": "asi",
       "description": "Exposes the game's internal Lua state over a localhost TCP port. Ships a stock-parity math library, keyboard/focus API, and the Loader utility namespace.",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "assets": ["lua_bridge_DEV.asi", "lua_bridge_DEV.ini", "lua_loader.ini", "lua_console.py"]
     },
     {

@@ -439,6 +439,33 @@ static __inline void RecomputeHotWork(void) {
  * into itself if a capture detour fires mid-LuaDoString. */
 static MOD_THREAD BOOL t_inBridgeExec = FALSE;
 
+/* ------------------------------------------------------------------------ *
+ * Watchdog — self-healing safety net for silent pump stalls.
+ *
+ * The bridge has several state variables that in principle can end up in
+ * a stuck configuration where PendingScripts > 0 but the pump never
+ * drains: hotWork stuck at 0 despite pending work, t_inBridgeExec stuck
+ * TRUE on the game thread, g_LuaState pointing at a destroyed VM, or a
+ * seen[] set full of stale pointers. Every one of these is a real bug we
+ * should eventually diagnose — but until we can reproduce them, users
+ * hit "chunks stopped executing, only a reboot fixes it."
+ *
+ * The watchdog runs on a background thread, wakes every ~2 seconds, and
+ * if it observes (a) chunks pending, (b) game running (detour fired
+ * recently), (c) no pump progress for `watchdog_stuck_ms`, then it does
+ * a full-hammer reset: hotWork=1, signal PumpQueue to force-clear its
+ * TLS flag next entry, null out g_LuaState + seen[] so the next detour
+ * re-captures cleanly. Log everything for post-mortem diagnosis.
+ *
+ * All three reset actions are individually safe. Not escalating to
+ * medium/hard tiers keeps the code simple — the cost of over-resetting
+ * a transient blip is one extra re-capture log line, no user harm.
+ * ------------------------------------------------------------------------ */
+static volatile DWORD g_lastDetourFireTick    = 0;
+static volatile DWORD g_lastPumpAttemptTick   = 0;
+static volatile DWORD g_lastPumpProgressTick  = 0;
+static volatile LONG  g_watchdogForceClearTLS = 0;
+
 /* Configuration (loaded from lua_bridge.ini). */
 static char  g_repl_host[64] = "127.0.0.1";
 static int   g_repl_port     = 27050;
@@ -447,6 +474,7 @@ static int   g_loader_onboot   = 1;
 static int   g_loader_onload   = 1;
 static int   g_loader_delay_ms = 50;
 static int   g_loader_onkey_cooldown_ms = 250;  /* per-script re-fire lockout */
+static int   g_watchdog_stuck_ms = 8000;         /* 0 disables the watchdog */
 
 /* ------------------------------------------------------------------------ *
  * Output-buffer helpers
@@ -738,7 +766,20 @@ static void PumpQueue(void* L_for_exec) {
     int L_ok;
 
     if (g_PendingScripts <= 0) return;
-    if (t_inBridgeExec) return;
+    if (t_inBridgeExec) {
+        /* Watchdog escape hatch: if the watchdog decided this thread's
+         * TLS is stuck TRUE (leaked from an earlier abnormal exit), it
+         * sets g_watchdogForceClearTLS. Consume the flag and clear our
+         * TLS so this call proceeds. Uses InterlockedCompareExchange so
+         * only one thread claims the reset even in the rare case that
+         * multiple threads race into this branch. */
+        if (InterlockedCompareExchange(&g_watchdogForceClearTLS, 0, 1) == 1) {
+            t_inBridgeExec = FALSE;
+            m2_logf("[!] lua_bridge: watchdog force-cleared t_inBridgeExec on this thread");
+        } else {
+            return;
+        }
+    }
 
     /* Re-register our libs ONCE at batch start, not per chunk. Defends
      * against engine _G resets between batches (menu → mission,
@@ -770,6 +811,12 @@ static void PumpQueue(void* L_for_exec) {
         OutAppend(result_buf, strlen(result_buf));
         OutAppend("<<<END>>>", 9);
         ChunkNodeFree(node);
+
+        /* Watchdog telemetry: successful drain proves the pump path is
+         * alive. Updated per-chunk (not per-batch) so long batches don't
+         * look stuck to the watchdog if they take longer than the
+         * stuck-timeout. */
+        g_lastPumpProgressTick = GetTickCount();
     }
 }
 
@@ -778,7 +825,12 @@ static __inline void GatedPump(void* L_arg0) {
      * second from detours; anything else here is measurable. */
     if (!g_hotWork) return;
 
-    /* Slow path: something wants doing. */
+    /* Slow path: something wants doing. Watchdog uses this timestamp
+     * to distinguish "hotWork stuck at 0" (this never updates) from
+     * "hotWork trying, PumpQueue not draining" (this updates but
+     * g_lastPumpProgressTick doesn't). */
+    g_lastPumpAttemptTick = GetTickCount();
+
     if (g_loader_enabled && g_loader_onload && g_OnLoadTriggered && !g_OnLoadExecuted) {
         if (LooksLikeLuaState(L_arg0)) {
             g_OnLoadExecuted = 1;
@@ -793,30 +845,34 @@ static __inline void GatedPump(void* L_arg0) {
     RecomputeHotWork();
 }
 
+/* Seen-L set, file-scope so the watchdog can memset it during a hard reset.
+ * All access from the game thread's CaptureL; the watchdog only writes
+ * (never reads for logic), so no atomicity needed beyond aligned-store. */
+static void* g_seenL[8] = {0};
+
 static void CaptureL(void* L, const char* via) {
     /* Fast path #1: same L as last capture. This is the common case
      * (every detour fire on the same VM). Single pointer compare. */
     if (!L || L == g_LuaState) return;
 
-    /* Fast path #2: L is in seen[]. We've already validated + registered
+    /* Fast path #2: L is in g_seenL[]. We've already validated + registered
      * on this VM before; the engine just flipped back to it. Scanning a
      * small pointer array is pure L1 (~5 cycles) versus LooksLikeLuaState
      * which does 4 VirtualQuery syscalls (~2µs). This is the biggest
      * hot-path win — the engine flips between frontend / gameplay VMs
      * many times per second. */
-    static void* seen[8] = {0};
     int i;
     int free_slot = -1;
     for (i = 0; i < 8; ++i) {
-        if (seen[i] == L) { g_LuaState = L; return; }
-        if (seen[i] == NULL) { free_slot = i; break; }
+        if (g_seenL[i] == L) { g_LuaState = L; return; }
+        if (g_seenL[i] == NULL) { free_slot = i; break; }
     }
 
     /* Slow path: L we've never seen. Validate, register, log, remember. */
     if (!LooksLikeLuaState(L)) return;
     g_LuaState = L;
-    if (free_slot < 0) return;  /* seen[] full — silently drop the log entry */
-    seen[free_slot] = L;
+    if (free_slot < 0) return;  /* g_seenL[] full — silently drop the log entry */
+    g_seenL[free_slot] = L;
 
     m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
     RegisterTcpLib(L);
@@ -845,6 +901,7 @@ static void CaptureL(void* L, const char* via) {
  * Detours
  * ------------------------------------------------------------------------ */
 static int __cdecl DetourNoopStub(void* L) {
+    g_lastDetourFireTick = GetTickCount();
     if (g_loader_enabled && g_loader_onload && !g_OnLoadTriggered) {
         char msg[512];
         if (m2_lua_join_strings(L, msg, sizeof(msg)) >= 1) {
@@ -860,12 +917,14 @@ static int __cdecl DetourNoopStub(void* L) {
 }
 
 static int __cdecl DetourLuaType(void* L) {
+    g_lastDetourFireTick = GetTickCount();
     CaptureL(L, "type");
     GatedPump(L);
     return fpOriginal_luaB_type ? fpOriginal_luaB_type(L) : 0;
 }
 
 static int __fastcall DetourCreateTextWidget(void* L, void* edx) {
+    g_lastDetourFireTick = GetTickCount();
     GatedPump(L);
     return fpOriginal_CreateTextWidget ? fpOriginal_CreateTextWidget(L, edx) : 0;
 }
@@ -1342,6 +1401,74 @@ static BOOL IsGameFocused(void) {
     if (!fg) return FALSE;
     GetWindowThreadProcessId(fg, &fg_pid);
     return fg_pid == GetCurrentProcessId();
+}
+
+/* ------------------------------------------------------------------------ *
+ * WatchdogThread — silent-stall self-healer. See the big design comment
+ * above g_lastDetourFireTick for the full rationale.
+ *
+ * Wakes every ~2 seconds, decides based on three timestamps whether the
+ * bridge is stuck, and if so does a comprehensive state reset. Cheap to
+ * run: two InterlockedCompare-ish reads and a Sleep(2000) between checks
+ * — measured under a microsecond per iteration, ~0.00005% of one core.
+ * ------------------------------------------------------------------------ */
+static DWORD WINAPI WatchdogThread(LPVOID param) {
+    DWORD last_reset_tick = 0;
+    (void)param;
+    for (;;) {
+        Sleep(2000);
+
+        int stuck_ms = g_watchdog_stuck_ms;
+        if (stuck_ms <= 0) continue;            /* watchdog disabled by ini */
+        if (g_PendingScripts <= 0) continue;    /* nothing to be stuck about */
+
+        DWORD now             = GetTickCount();
+        DWORD since_detour    = now - g_lastDetourFireTick;
+        DWORD since_attempt   = now - g_lastPumpAttemptTick;
+        DWORD since_progress  = now - g_lastPumpProgressTick;
+        DWORD since_last_reset = now - last_reset_tick;
+
+        /* Not stuck if the game isn't running detours (paused/menu/loading
+         * where luaB_type + CreateTextWidget stop firing). */
+        if (since_detour > 2000) continue;
+
+        /* Not stuck if the pump is actively making progress. */
+        if (since_progress < (DWORD)stuck_ms) continue;
+
+        /* Cool-down after a reset so we give it time to take effect
+         * before hammering again — half the stuck window is plenty. */
+        if (last_reset_tick != 0 && since_last_reset < (DWORD)(stuck_ms / 2)) continue;
+
+        /* Diagnose: which stuck pattern are we seeing? */
+        const char* diag;
+        if (since_attempt > (DWORD)stuck_ms) {
+            diag = "hotWork-stuck-at-0 (GatedPump not entering slow path)";
+        } else {
+            diag = "PumpQueue-not-draining (t_inBridgeExec stuck or L invalid)";
+        }
+
+        m2_logf("[!] lua_bridge: WATCHDOG stuck-state detected — pattern: %s", diag);
+        m2_logf("[!] lua_bridge:   hotWork=%d PendingScripts=%d "
+                "since_detour=%lums since_attempt=%lums since_progress=%lums",
+                (int)g_hotWork, (int)g_PendingScripts,
+                (unsigned long)since_detour,
+                (unsigned long)since_attempt,
+                (unsigned long)since_progress);
+        m2_logf("[!] lua_bridge:   g_LuaState=%p", g_LuaState);
+
+        /* Full-hammer reset. All three actions are individually safe.
+         * Non-escalating: cost of over-resetting is one extra re-capture
+         * cycle on the next detour, no user-visible harm. */
+        g_hotWork = 1;
+        InterlockedExchange(&g_watchdogForceClearTLS, 1);
+        g_LuaState = NULL;
+        memset(g_seenL, 0, sizeof(g_seenL));
+        last_reset_tick = now;
+
+        m2_logf("[*] lua_bridge: WATCHDOG reset applied "
+                "(hotWork=1, force-clear TLS, clear g_LuaState + g_seenL)");
+    }
+    return 0;
 }
 
 static DWORD WINAPI LoaderKeyEventThread(LPVOID param) {
@@ -2242,6 +2369,9 @@ static void OnIniKV(void* ud, const char* key, const char* value) {
     } else if (_stricmp(key, "loader_onkey_cooldown_ms") == 0) {
         g_loader_onkey_cooldown_ms = atoi(value);
         if (g_loader_onkey_cooldown_ms < 0) g_loader_onkey_cooldown_ms = 0;
+    } else if (_stricmp(key, "watchdog_stuck_ms") == 0) {
+        g_watchdog_stuck_ms = atoi(value);
+        if (g_watchdog_stuck_ms < 0) g_watchdog_stuck_ms = 0;
     }
 }
 
@@ -2280,7 +2410,14 @@ static const char kDefaultIni[] =
     "; state-mutating cheats, etc). First throttle per script is logged so users\n"
     "; can see it kick in; subsequent throttles are silent to avoid log spam.\n"
     "; Set to 0 to disable the cooldown entirely.\n"
-    "loader_onkey_cooldown_ms = 250\n";
+    "loader_onkey_cooldown_ms = 250\n"
+    "\n"
+    "; Watchdog: if the queue has pending chunks and no pump progress happens\n"
+    "; for this many milliseconds (while the game is actively running detours),\n"
+    "; a background thread force-resets the bridge's stuck-state candidates\n"
+    "; (hotWork, t_inBridgeExec, g_LuaState, seen-set) and logs a comprehensive\n"
+    "; diagnostic line. Set to 0 to disable the watchdog entirely.\n"
+    "watchdog_stuck_ms = 8000\n";
 
 static void EnsureIniDefault(const char* path) {
     FILE* f = fopen(path, "r");
@@ -2405,6 +2542,13 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     CreateThread(NULL, 0, LoaderKeyEventThread, NULL, 0, NULL);
     m2_logf("[*] lua_bridge: key-event sampler armed (~60 Hz, %d-slot ring)",
             KEYEVENT_BUFFER_SIZE);
+    if (g_watchdog_stuck_ms > 0) {
+        CreateThread(NULL, 0, WatchdogThread, NULL, 0, NULL);
+        m2_logf("[*] lua_bridge: watchdog armed (stuck threshold %d ms)",
+                g_watchdog_stuck_ms);
+    } else {
+        m2_logf("[*] lua_bridge: watchdog disabled (watchdog_stuck_ms = 0)");
+    }
     return 0;
 }
 

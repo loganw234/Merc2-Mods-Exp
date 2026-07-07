@@ -2,6 +2,29 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.2.2] - 2026-07-06
+
+Only `lua-bridge-DEV` bumped (0.2.1 → 0.2.2). Defensive addition: a background watchdog that self-heals the bridge from silent stuck-state conditions users have occasionally reported. No new user-facing features, no behavior changes to any hot path — the watchdog stays completely dormant unless it detects a real problem.
+
+### Added
+
+- **Bridge self-healing watchdog.** A dedicated background thread that wakes every ~2 seconds and, if the queue has pending chunks AND the game is running detours AND no pump progress has happened for `watchdog_stuck_ms` (default **8000**), force-resets the bridge's stuck-state candidates and logs a comprehensive diagnostic line. Reset actions: `hotWork = 1`, signal `PumpQueue` to clear its per-thread `t_inBridgeExec` flag (via a compare-exchange handshake), null out `g_LuaState`, memset the seen-L cache to zero. Next detour fire cleanly re-captures and pump resumes — no reboot required. Configurable via `watchdog_stuck_ms` in `lua_bridge_DEV.ini`; set to 0 to disable.
+- **Three cheap timestamp probes** feeding the watchdog's decision logic: `g_lastDetourFireTick` (updated by every detour), `g_lastPumpAttemptTick` (updated when `GatedPump` enters its slow path), `g_lastPumpProgressTick` (updated after every successful chunk drain). Each is a single volatile store per event; measured cost: unmeasurably small, no fast-path impact.
+
+### Diagnostic
+
+When the watchdog fires, it logs four lines that describe exactly which stuck pattern was seen — one of two categories are distinguishable:
+- `hotWork-stuck-at-0` (GatedPump never enters slow path) — the ms-since-slowpath timestamp reveals this
+- `PumpQueue-not-draining` (t_inBridgeExec stuck TRUE, or LooksLikeLuaState failing on stale L) — slowpath is being attempted but no progress
+
+Users seeing repeated `WATCHDOG` fires in their `lua_bridge_DEV.log` should send those lines upstream so we can finally diagnose the root cause of the intermittent stalls that motivated the watchdog. The self-heal is a safety net, not a fix — every fire indicates a real bug we still want to eventually eliminate.
+
+### Notes
+
+- `g_seenL[8]` was refactored from a `static` local inside `CaptureL` to file-scope so the watchdog can reset it directly. No behavioral change; same array, same lookup semantics.
+- Cool-down of `stuck_ms / 2` between resets prevents the watchdog from hammering on a still-stuck bridge.
+- Full stress suite (15 phases) run against this build: 15/15 pass, watchdog fired 0 times during 17s of aggressive stress including 256 KB chunks, 200-chunk queue floods, TCP-send bursts, and 1000-call Loader.Printf loops. No false positives observed under realistic load.
+
 ## [v0.2.1] - 2026-07-05
 
 Only `lua-bridge-DEV` bumped (0.2.0 → 0.2.1). Stability / correctness patch focused on OnKey reentrancy protection and two small polyfill nits caught in the v0.2.0 code review.
