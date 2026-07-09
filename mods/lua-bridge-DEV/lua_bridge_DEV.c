@@ -1746,20 +1746,15 @@ static int LuaLoaderPrintf(void* L) {
  * KeyboardStateTString definition for the buffer-reuse caveats.
  * ------------------------------------------------------------------------ */
 static int LuaLoaderGetKeyboardState(void* L) {
-    char* Lc;
-    char* top;
+    /* Fast path — see the note on LuaLoaderIsKeyDown below. */
+    char* Lc  = (char*)L;
+    char* top = *(char**)(Lc + LUA_OFF_TOP);
     int i;
-
-    if (!L || !LooksLikeLuaState(L)) return 0;
 
     for (i = 0; i < 256; ++i) {
         SHORT s = GetAsyncKeyState(i);
         g_kbStateTString.data[i] = (s & 0x8000) ? (char)0x80 : (char)0x00;
     }
-
-    Lc  = (char*)L;
-    top = *(char**)(Lc + LUA_OFF_TOP);
-    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
 
     *(void**)top                             = &g_kbStateTString;
     *(int*)(top + TVALUE_TT_OFFSET)          = LUA_TSTRING;
@@ -1777,27 +1772,28 @@ static int LuaLoaderGetKeyboardState(void* L) {
  * caller only needs one key; also easier to teach.
  * ------------------------------------------------------------------------ */
 static int LuaLoaderIsKeyDown(void* L) {
-    char* Lc;
-    char* base;
-    char* top;
+    /* Fast path — no SafeProbe / LooksLikeLuaState. When Lua's own
+     * dispatch calls a registered C function, L / base / top are
+     * engine-guaranteed valid; reserved LUA_MINSTACK slots at top mean
+     * we can push one return value without checking. Dropping the checks
+     * saves 6+ VirtualQuery syscalls per call (~15µs → ~1µs). Safe
+     * because this function is only reachable via luaL_register-
+     * installed dispatch, never called with a caller-supplied L. Same
+     * treatment applied below to GetKeyboardState / IsGameFocused /
+     * PopKeyEvents / ClearKeyEvents / math.*. */
+    char* Lc   = (char*)L;
+    char* base = *(char**)(Lc + LUA_OFF_BASE);
+    char* top  = *(char**)(Lc + LUA_OFF_TOP);
     int   vk;
     SHORT ks;
 
-    if (!L || !LooksLikeLuaState(L)) return 0;
-    if (m2_lua_nargs(L) < 1) return 0;
-
-    Lc   = (char*)L;
-    base = *(char**)(Lc + LUA_OFF_BASE);
-    if (!base || !SafeProbe(base, TVALUE_SIZE)) return 0;
+    if (!base || (top - base) < TVALUE_SIZE) return 0;
     if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;
 
     vk = (int)*(float*)base;  /* lua_Number = float in this build */
     if (vk < 0 || vk > 255) return 0;
 
     ks = GetAsyncKeyState(vk);
-
-    top = *(char**)(Lc + LUA_OFF_TOP);
-    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
 
     *(int*)top                       = (ks & 0x8000) ? 1 : 0;
     *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TBOOLEAN;
@@ -1821,18 +1817,13 @@ static int LuaLoaderIsKeyDown(void* L) {
  * client-side edge detection on GetKeyboardState does.
  * ------------------------------------------------------------------------ */
 static int LuaLoaderPopKeyEvents(void* L) {
-    char* Lc;
-    char* top;
+    /* Fast path — see the note on LuaLoaderIsKeyDown below. */
+    char* Lc  = (char*)L;
+    char* top = *(char**)(Lc + LUA_OFF_TOP);
     int   n;
-
-    if (!L || !LooksLikeLuaState(L)) return 0;
 
     n = KeyEventsPopAll((uint8_t*)g_keyEventsTString.data, KEYEVENT_BUFFER_SIZE);
     g_keyEventsTString.len = (uint32_t)n;
-
-    Lc  = (char*)L;
-    top = *(char**)(Lc + LUA_OFF_TOP);
-    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
 
     *(void**)top                     = &g_keyEventsTString;
     *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TSTRING;
@@ -1868,17 +1859,361 @@ static int LuaLoaderClearKeyEvents(void* L) {
  * backgrounded, or wrap raw IsKeyDown queries with focus-awareness).
  * ------------------------------------------------------------------------ */
 static int LuaLoaderIsGameFocused(void* L) {
-    char* Lc;
-    char* top;
-    if (!L || !LooksLikeLuaState(L)) return 0;
-
-    Lc  = (char*)L;
-    top = *(char**)(Lc + LUA_OFF_TOP);
-    if (!SafeProbe(top, TVALUE_SIZE)) return 0;
+    /* Fast path — see the note on LuaLoaderIsKeyDown below. */
+    char* Lc  = (char*)L;
+    char* top = *(char**)(Lc + LUA_OFF_TOP);
 
     *(int*)top                       = IsGameFocused() ? 1 : 0;
     *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TBOOLEAN;
     *(char**)(Lc + LUA_OFF_TOP)      = top + TVALUE_SIZE;
+    return 1;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Persistence — Loader.SaveVar(key, value) / Loader.LoadVar(key)
+ *
+ * Simple key-value store that survives game restarts. Values are numbers,
+ * strings, or booleans. Stored on disk as `lua_loader_data.ini` next to
+ * the .asi, in a human-readable format that users can hand-edit if they
+ * want to reset a value:
+ *
+ *   ; auto-managed by lua-bridge
+ *   ; Format: key=type:value  (n=number, s=string, b=boolean 0/1)
+ *   MasterCheatMenu_Progress=n:18
+ *   MyMod_Setting=s:hardcore
+ *   MyMod_TutorialSeen=b:1
+ *
+ * Namespacing: single flat namespace shared by every script. Wiki docs
+ * tell script authors to prefix keys with their script name.
+ *
+ * Type preservation: SaveVar accepts number/string/boolean, LoadVar
+ * returns the same Lua type it was saved as (or nil if the key isn't
+ * set). Numbers and booleans are stored inline; strings are heap-
+ * allocated FixedTStrings with FIXEDBIT set (GC-ignored, same trick as
+ * g_kbStateTString). New string values allocate fresh — old strings are
+ * intentionally leaked so any Lua variable still holding a reference to
+ * a previous LoadVar result stays valid. Bounded by SaveVar call rate
+ * (thousands of calls per session is still ~100 KB, tolerable).
+ *
+ * Crash safety: SaveVar writes to `lua_loader_data.ini.tmp` and then
+ * MoveFileExA(MOVEFILE_REPLACE_EXISTING) — a crash mid-write leaves the
+ * old file intact rather than truncating.
+ * ------------------------------------------------------------------------ */
+#define DATA_KEY_MAX      128
+#define DATA_STR_MAX      2048
+#define DATA_TYPE_NUMBER  'n'
+#define DATA_TYPE_STRING  's'
+#define DATA_TYPE_BOOL    'b'
+
+typedef struct DataEntry {
+    char    key[DATA_KEY_MAX];
+    char    type;      /* 'n' / 's' / 'b' */
+    float   num_val;
+    int     bool_val;
+    void*   str_tstring;   /* FixedTString ptr for type='s', NULL otherwise */
+    struct DataEntry* next;
+} DataEntry;
+
+static DataEntry*        g_dataDict     = NULL;
+static CRITICAL_SECTION  g_dataMtx;
+static int               g_dataMtxInit  = 0;
+static int               g_dataLoaded   = 0;
+
+/* Allocate a fresh Lua-visible TString for a value. Uses the same layout
+ * trick as g_kbStateTString / g_chunkSource — matches Pandemic's packed
+ * TValue, marked FIXEDBIT so the engine's GC leaves it alone.
+ *
+ * Deliberately leaked (never freed). Each SaveVar overwriting an existing
+ * key allocates a NEW TString rather than mutating the existing one, so
+ * any Lua variable holding a reference to a previous LoadVar result
+ * remains valid with the old value. Bounded by write frequency — 1000
+ * SaveVar calls with 100-char strings = 100 KB, fine for a game session. */
+#pragma pack(push, 4)
+typedef struct DataTString {
+    void*    next_gc;
+    uint8_t  tt;
+    uint8_t  marked;
+    uint8_t  reserved;
+    uint8_t  _pad;
+    uint32_t hash;
+    uint32_t len;
+    char     data[1];   /* flexible; actual allocation is sizeof(struct) + len */
+} DataTString;
+#pragma pack(pop)
+
+static DataTString* AllocDataTString(const char* value, size_t len) {
+    DataTString* ts = (DataTString*)malloc(sizeof(DataTString) + len);
+    if (!ts) return NULL;
+    ts->next_gc = NULL;
+    ts->tt      = (uint8_t)LUA_TSTRING;
+    ts->marked  = 0x20 | 0x01;   /* FIXEDBIT | WHITE0BIT */
+    ts->reserved= 0;
+    ts->_pad    = 0;
+    ts->hash    = 0xDA7A0000u | (uint32_t)(len & 0xFFFF);
+    ts->len     = (uint32_t)len;
+    memcpy(ts->data, value, len);
+    return ts;
+}
+
+/* Value escaping for the on-disk format. Only backslash, CR, LF need
+ * quoting since we use `=` and `:` as delimiters but strip them on
+ * parse; user string values containing `=` or `:` round-trip fine. */
+static void EscapeValue(const char* in, char* out, size_t out_size) {
+    size_t o = 0;
+    while (*in && o + 3 < out_size) {
+        char c = *in++;
+        if (c == '\\')      { out[o++] = '\\'; out[o++] = '\\'; }
+        else if (c == '\n') { out[o++] = '\\'; out[o++] = 'n';  }
+        else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r';  }
+        else                { out[o++] = c; }
+    }
+    out[o] = '\0';
+}
+
+static void UnescapeValue(const char* in, char* out, size_t out_size) {
+    size_t o = 0;
+    while (*in && o + 1 < out_size) {
+        char c = *in++;
+        if (c == '\\' && *in) {
+            char n = *in++;
+            if      (n == 'n')  out[o++] = '\n';
+            else if (n == 'r')  out[o++] = '\r';
+            else if (n == '\\') out[o++] = '\\';
+            else                out[o++] = n;      /* unknown escape — pass through */
+        } else {
+            out[o++] = c;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Look up an entry by key. Caller must hold g_dataMtx. Returns NULL if not present. */
+static DataEntry* DataDictFind(const char* key) {
+    DataEntry* e = g_dataDict;
+    while (e) {
+        if (strcmp(e->key, key) == 0) return e;
+        e = e->next;
+    }
+    return NULL;
+}
+
+/* Insert or update. Caller must hold g_dataMtx. `type` is 'n'/'s'/'b'. */
+static DataEntry* DataDictUpsert(const char* key, char type) {
+    DataEntry* e = DataDictFind(key);
+    if (!e) {
+        e = (DataEntry*)malloc(sizeof(DataEntry));
+        if (!e) return NULL;
+        memset(e, 0, sizeof(*e));
+        strncpy(e->key, key, DATA_KEY_MAX - 1);
+        e->key[DATA_KEY_MAX - 1] = '\0';
+        e->next = g_dataDict;
+        g_dataDict = e;
+    }
+    e->type = type;
+    /* Don't null out fields other than the one being written — old
+     * str_tstring stays valid for any Lua vars still referencing it. */
+    return e;
+}
+
+static void PersistDataFileLocked(void) {
+    char ini_path[MAX_PATH];
+    char tmp_path[MAX_PATH];
+    FILE* f;
+    DataEntry* e;
+
+    m2_module_path(g_hModule, "lua_loader_data.ini", ini_path, sizeof(ini_path));
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", ini_path);
+
+    f = fopen(tmp_path, "w");
+    if (!f) return;
+
+    fputs("; lua_loader_data.ini — auto-managed by lua-bridge Loader.SaveVar/LoadVar\n"
+          "; Format: key=type:value   (n=number, s=string, b=boolean 0/1)\n"
+          "; Safe to hand-edit while the game is not running; edits made while\n"
+          "; the game is running will be overwritten on the next SaveVar.\n\n", f);
+
+    for (e = g_dataDict; e; e = e->next) {
+        if (e->type == DATA_TYPE_NUMBER) {
+            fprintf(f, "%s=n:%g\n", e->key, (double)e->num_val);
+        } else if (e->type == DATA_TYPE_BOOL) {
+            fprintf(f, "%s=b:%d\n", e->key, e->bool_val ? 1 : 0);
+        } else if (e->type == DATA_TYPE_STRING && e->str_tstring) {
+            DataTString* ts = (DataTString*)e->str_tstring;
+            char escaped[DATA_STR_MAX * 2 + 4];
+            /* Build a null-terminated copy of the TString bytes for EscapeValue. */
+            char raw[DATA_STR_MAX + 1];
+            size_t n = ts->len < DATA_STR_MAX ? ts->len : DATA_STR_MAX;
+            memcpy(raw, ts->data, n);
+            raw[n] = '\0';
+            EscapeValue(raw, escaped, sizeof(escaped));
+            fprintf(f, "%s=s:%s\n", e->key, escaped);
+        }
+    }
+    fclose(f);
+
+    /* Atomic replace so a crash mid-write leaves the old file intact. */
+    if (!MoveFileExA(tmp_path, ini_path, MOVEFILE_REPLACE_EXISTING)) {
+        m2_logf("[!] lua_bridge: SaveVar persist rename failed (GLE=%lu)",
+                (unsigned long)GetLastError());
+    }
+}
+
+static void LoadDataFileLocked(void) {
+    char ini_path[MAX_PATH];
+    FILE* f;
+    char line[DATA_STR_MAX * 2 + 32];
+
+    m2_module_path(g_hModule, "lua_loader_data.ini", ini_path, sizeof(ini_path));
+    f = fopen(ini_path, "r");
+    if (!f) return;    /* file doesn't exist yet — first run, empty dict is fine */
+
+    int loaded_count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        /* Skip blank lines + comments. */
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == ';' || *p == '#' || *p == '\n' || *p == '\r' || *p == '\0') continue;
+
+        char* eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char* type_val = eq + 1;
+
+        /* Strip trailing whitespace from key. */
+        size_t klen = strlen(p);
+        while (klen > 0 && (p[klen - 1] == ' ' || p[klen - 1] == '\t')) p[--klen] = '\0';
+
+        /* type_val looks like `n:18` — first char is type, then colon, then value. */
+        if (type_val[0] == '\0' || type_val[1] != ':') continue;
+        char type = type_val[0];
+        char* raw_val = type_val + 2;
+
+        /* Strip trailing newline from value. */
+        size_t vlen = strlen(raw_val);
+        while (vlen > 0 && (raw_val[vlen - 1] == '\n' || raw_val[vlen - 1] == '\r')) {
+            raw_val[--vlen] = '\0';
+        }
+
+        DataEntry* e = DataDictUpsert(p, type);
+        if (!e) continue;
+        if (type == DATA_TYPE_NUMBER) {
+            e->num_val = (float)atof(raw_val);
+        } else if (type == DATA_TYPE_BOOL) {
+            e->bool_val = (atoi(raw_val) != 0) ? 1 : 0;
+        } else if (type == DATA_TYPE_STRING) {
+            char unescaped[DATA_STR_MAX + 1];
+            UnescapeValue(raw_val, unescaped, sizeof(unescaped));
+            size_t ulen = strlen(unescaped);
+            e->str_tstring = AllocDataTString(unescaped, ulen);
+        }
+        loaded_count++;
+    }
+    fclose(f);
+    if (loaded_count > 0) {
+        m2_logf("[*] lua_bridge: Loaded %d persisted variable(s) from lua_loader_data.ini",
+                loaded_count);
+    }
+}
+
+static void InitDataDict(void) {
+    if (!g_dataMtxInit) {
+        InitializeCriticalSection(&g_dataMtx);
+        g_dataMtxInit = 1;
+    }
+    EnterCriticalSection(&g_dataMtx);
+    if (!g_dataLoaded) {
+        g_dataLoaded = 1;
+        LoadDataFileLocked();
+    }
+    LeaveCriticalSection(&g_dataMtx);
+}
+
+/* Loader.SaveVar(sKey, xValue) — accepts number, string, boolean.
+ * Persists to disk immediately. Returns nothing. */
+static int LuaLoaderSaveVar(void* L) {
+    char* Lc; char* base;
+    char key[DATA_KEY_MAX];
+    int tt_val;
+    if (!L) return 0;
+    if (m2_lua_nargs(L) < 2) return 0;
+    if (m2_lua_arg_string(L, 0, key, sizeof(key)) <= 0) return 0;
+    if (!g_dataMtxInit) InitDataDict();
+
+    Lc   = (char*)L;
+    base = *(char**)(Lc + LUA_OFF_BASE);
+    if (!base) return 0;
+    tt_val = *(int*)(base + TVALUE_SIZE + TVALUE_TT_OFFSET);
+
+    EnterCriticalSection(&g_dataMtx);
+    if (tt_val == LUA_TNUMBER) {
+        DataEntry* e = DataDictUpsert(key, DATA_TYPE_NUMBER);
+        if (e) e->num_val = *(float*)(base + TVALUE_SIZE);
+    } else if (tt_val == LUA_TBOOLEAN) {
+        DataEntry* e = DataDictUpsert(key, DATA_TYPE_BOOL);
+        if (e) e->bool_val = (*(int*)(base + TVALUE_SIZE) != 0) ? 1 : 0;
+    } else if (tt_val == LUA_TSTRING) {
+        char sval[DATA_STR_MAX];
+        int slen = m2_lua_arg_string(L, 1, sval, sizeof(sval));
+        if (slen > 0) {
+            DataEntry* e = DataDictUpsert(key, DATA_TYPE_STRING);
+            if (e) {
+                /* Fresh TString; old one stays alive for any Lua vars still
+                 * referencing a prior LoadVar result. Intentional leak. */
+                e->str_tstring = AllocDataTString(sval, (size_t)slen);
+            }
+        }
+    } else {
+        LeaveCriticalSection(&g_dataMtx);
+        return 0;  /* unsupported value type */
+    }
+    PersistDataFileLocked();
+    LeaveCriticalSection(&g_dataMtx);
+    return 0;
+}
+
+/* Loader.LoadVar(sKey) — returns number/string/boolean (with original
+ * type) or nil if the key isn't set. */
+static int LuaLoaderLoadVar(void* L) {
+    char* Lc; char* top;
+    char key[DATA_KEY_MAX];
+    DataEntry* e;
+    if (!L) return 0;
+    if (m2_lua_nargs(L) < 1) return 0;
+    if (m2_lua_arg_string(L, 0, key, sizeof(key)) <= 0) return 0;
+    if (!g_dataMtxInit) InitDataDict();
+
+    Lc  = (char*)L;
+    top = *(char**)(Lc + LUA_OFF_TOP);
+
+    EnterCriticalSection(&g_dataMtx);
+    e = DataDictFind(key);
+    if (!e) {
+        LeaveCriticalSection(&g_dataMtx);
+        /* Push nil — tt = LUA_TNIL, value doesn't matter. */
+        *(int*)top                       = 0;
+        *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TNIL;
+        *(char**)(Lc + LUA_OFF_TOP)      = top + TVALUE_SIZE;
+        return 1;
+    }
+
+    if (e->type == DATA_TYPE_NUMBER) {
+        *(float*)top                     = e->num_val;
+        *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TNUMBER;
+    } else if (e->type == DATA_TYPE_BOOL) {
+        *(int*)top                       = e->bool_val ? 1 : 0;
+        *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TBOOLEAN;
+    } else if (e->type == DATA_TYPE_STRING && e->str_tstring) {
+        *(void**)top                     = e->str_tstring;
+        *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TSTRING;
+    } else {
+        LeaveCriticalSection(&g_dataMtx);
+        *(int*)top                       = 0;
+        *(int*)(top + TVALUE_TT_OFFSET)  = LUA_TNIL;
+        *(char**)(Lc + LUA_OFF_TOP)      = top + TVALUE_SIZE;
+        return 1;
+    }
+    LeaveCriticalSection(&g_dataMtx);
+    *(char**)(Lc + LUA_OFF_TOP) = top + TVALUE_SIZE;
     return 1;
 }
 
@@ -1889,6 +2224,8 @@ static const luaL_Reg loader_lib[] = {
     {"PopKeyEvents",     LuaLoaderPopKeyEvents},
     {"ClearKeyEvents",   LuaLoaderClearKeyEvents},
     {"IsGameFocused",    LuaLoaderIsGameFocused},
+    {"SaveVar",          LuaLoaderSaveVar},
+    {"LoadVar",          LuaLoaderLoadVar},
     {NULL, NULL}
 };
 
@@ -1926,22 +2263,20 @@ static void RegisterLoaderLib(void* L) {
  * that motivated each entry.
  * ------------------------------------------------------------------------ */
 
-/* One-arg → one-return single-precision math wrapper. Same shape as the
- * hand-written prototypes above, minus the copy-paste. All safety checks
- * (L validation, arg count, type tag, top/base bounds via SafeProbe) are
- * preserved — this is a naming shortcut, not a check shortcut. */
+/* One-arg → one-return single-precision math wrapper. Fast path: no
+ * SafeProbe / LooksLikeLuaState — same reasoning as LuaLoaderIsKeyDown
+ * (engine guarantees L/base/top valid when Lua dispatches to a
+ * registered C function). Just checks arg count via top-base pointer
+ * arithmetic and the arg's type tag. */
 #define MATH_ONEARG(fn_name, cfunc)                                          \
     static int LuaMath##fn_name(void* L) {                                    \
-        char* Lc; char* base; char* top; float x;                             \
-        if (!L || !LooksLikeLuaState(L)) return 0;                            \
-        if (m2_lua_nargs(L) < 1) return 0;                                    \
-        Lc   = (char*)L;                                                      \
-        base = *(char**)(Lc + LUA_OFF_BASE);                                  \
-        if (!base || !SafeProbe(base, TVALUE_SIZE)) return 0;                 \
+        char* Lc   = (char*)L;                                                \
+        char* base = *(char**)(Lc + LUA_OFF_BASE);                            \
+        char* top  = *(char**)(Lc + LUA_OFF_TOP);                             \
+        float x;                                                              \
+        if (!base || (top - base) < TVALUE_SIZE) return 0;                    \
         if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;        \
         x = *(float*)base;                                                    \
-        top = *(char**)(Lc + LUA_OFF_TOP);                                    \
-        if (!SafeProbe(top, TVALUE_SIZE)) return 0;                           \
         *(float*)top                    = (float)cfunc(x);                    \
         *(int*)(top + TVALUE_TT_OFFSET) = LUA_TNUMBER;                        \
         *(char**)(Lc + LUA_OFF_TOP)     = top + TVALUE_SIZE;                  \
@@ -1951,19 +2286,16 @@ static void RegisterLoaderLib(void* L) {
 /* Two-arg → one-return single-precision math wrapper. */
 #define MATH_TWOARG(fn_name, cfunc)                                          \
     static int LuaMath##fn_name(void* L) {                                    \
-        char* Lc; char* base; char* top; float x, y;                          \
-        if (!L || !LooksLikeLuaState(L)) return 0;                            \
-        if (m2_lua_nargs(L) < 2) return 0;                                    \
-        Lc   = (char*)L;                                                      \
-        base = *(char**)(Lc + LUA_OFF_BASE);                                  \
-        if (!base || !SafeProbe(base, TVALUE_SIZE * 2)) return 0;             \
+        char* Lc   = (char*)L;                                                \
+        char* base = *(char**)(Lc + LUA_OFF_BASE);                            \
+        char* top  = *(char**)(Lc + LUA_OFF_TOP);                             \
+        float x, y;                                                           \
+        if (!base || (top - base) < TVALUE_SIZE * 2) return 0;                \
         if (*(int*)(base + TVALUE_TT_OFFSET) != LUA_TNUMBER) return 0;        \
         if (*(int*)(base + TVALUE_SIZE + TVALUE_TT_OFFSET) != LUA_TNUMBER)    \
             return 0;                                                         \
         x = *(float*)base;                                                    \
         y = *(float*)(base + TVALUE_SIZE);                                    \
-        top = *(char**)(Lc + LUA_OFF_TOP);                                    \
-        if (!SafeProbe(top, TVALUE_SIZE)) return 0;                           \
         *(float*)top                    = (float)cfunc(x, y);                 \
         *(int*)(top + TVALUE_TT_OFFSET) = LUA_TNUMBER;                        \
         *(char**)(Lc + LUA_OFF_TOP)     = top + TVALUE_SIZE;                  \
@@ -2468,6 +2800,7 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     InitKeyboardStateTString();
     InitKeyEventsTString();
     InitLoaderPrintfLog();
+    InitDataDict();
 
     mod = GetModuleHandleA(NULL);
     if (!mod) {

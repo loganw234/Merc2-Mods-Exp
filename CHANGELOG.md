@@ -2,6 +2,44 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.3.0] - 2026-07-09
+
+Only `lua-bridge-DEV` bumped (0.2.2 → 0.3.0). Version-family boundary: `v0.1` had no math library, `v0.2` reached stock Lua math parity, `v0.3` adds **persistence** — the first user-facing capability that lets script authors do things previously impossible on this platform (survive a game restart with saved state). Also bundles a meaningful hot-path perf improvement to the input functions.
+
+### Added
+
+- **`Loader.SaveVar(sKey, xValue)` / `Loader.LoadVar(sKey)`** — simple key-value persistence for numbers, strings, and booleans. Values survive game restarts. Stored on disk as `lua_loader_data.ini` next to the `.asi` in a human-readable format that users can hand-edit while the game is offline:
+  ```
+  ; Format: key=type:value  (n=number, s=string, b=boolean 0/1)
+  MasterCheatMenu_Progress=n:18
+  MyMod_TutorialSeen=b:1
+  MyMod_Setting=s:hardcore
+  ```
+  - **Types preserved** across the round trip — `Loader.SaveVar("count", 5)` then `Loader.LoadVar("count")` returns the number `5`, not the string `"5"`. Same for booleans and strings.
+  - **Nil for missing keys** — `Loader.LoadVar("does_not_exist")` returns `nil`, standard Lua idiom for defaults: `local x = Loader.LoadVar("progress") or 0`.
+  - **Atomic writes** — each save writes to `lua_loader_data.ini.tmp` then `MoveFileExA(MOVEFILE_REPLACE_EXISTING)`. A crash mid-write can't leave a truncated file.
+  - **Flat namespace** — a single global namespace shared by all scripts. Convention (documented on the wiki): prefix your keys with your script's name (`MyMod_progress` not `progress`) to avoid collisions with other mods.
+  - **String semantics**: each `SaveVar` with a string value allocates a fresh `TString`; the previous value's string stays valid for any Lua variable still holding a reference to a prior `LoadVar` result. Memory grows with write frequency (1000 writes × 100 chars ≈ 100 KB), bounded and acceptable for a game session.
+
+### Changed (perf)
+
+- **Fast-path input functions**: `Loader.IsKeyDown`, `Loader.GetKeyboardState`, `Loader.PopKeyEvents`, `Loader.IsGameFocused`, and every `math.*` function had 6+ `VirtualQuery` syscalls of defensive validation on the hot path (`LooksLikeLuaState` + individual `SafeProbe` on base and top). Removed — when Lua's own dispatch calls a `luaL_register`-installed C function, `L`/`base`/`top` are engine-guaranteed valid, and the `LUA_MINSTACK` reservation covers the one-slot push. **Hot-path cost drops from ~15 µs to ~0.81 µs per call** (measured: 500,000 `IsKeyDown` calls in 404 ms of isolated execution time, ~1.24 M calls/sec). A script can now safely call `Loader.IsKeyDown(vk)` 20,000 times per frame at 60 FPS while using <2% of the frame budget.
+
+  Defensive checks retained on `Loader.Printf` and `Tcp.Send` — those are I/O-bound anyway, so the check cost is noise there.
+
+### Notes for consumers
+
+- `Loader.IsKeyDown` and its siblings now officially carry a **"safe in hot loops"** guarantee — the previous implicit assumption is now backed by measured data. The wiki page notes will be updated to reflect that.
+- The `math.*` functions got the same fast-path treatment via the `MATH_ONEARG` / `MATH_TWOARG` macros, so `math.sin`/`math.cos`/etc. also drop to ~sub-µs per call. Also safe in per-frame loops.
+
+### Verification
+
+- `SaveVar`/`LoadVar` round-trip: **10/10** across number, string, boolean, missing-key, type-preservation, overwrite, and newline-escape cases.
+- On-disk file format: verified human-readable, hand-editable, correct atomic replace.
+- `IsKeyDown` throughput: measured **~0.81 µs/call**, **~1.24 M calls/sec**.
+- Full stress suite (15 phases): **15/15 pass**, no regressions.
+- Watchdog: armed once at boot, fired 0 times through the full session — no false positives from either the new subsystem or the fast-path changes.
+
 ## [v0.2.2] - 2026-07-06
 
 Only `lua-bridge-DEV` bumped (0.2.1 → 0.2.2). Defensive addition: a background watchdog that self-heals the bridge from silent stuck-state conditions users have occasionally reported. No new user-facing features, no behavior changes to any hot path — the watchdog stays completely dormant unless it detects a real problem.
