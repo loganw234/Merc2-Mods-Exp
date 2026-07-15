@@ -464,6 +464,11 @@ static MOD_THREAD BOOL t_inBridgeExec = FALSE;
 static volatile DWORD g_lastDetourFireTick    = 0;
 static volatile DWORD g_lastPumpAttemptTick   = 0;
 static volatile DWORD g_lastPumpProgressTick  = 0;
+/* 0 = not currently executing; else the tick when we entered LuaDoString.
+ * Read by the watchdog to detect "hung inside a native call from Lua" — the
+ * case where the game thread is blocked so no more detours can fire and the
+ * since_detour heuristic would incorrectly bail. */
+static volatile DWORD g_bridgeExecStartTick   = 0;
 static volatile LONG  g_watchdogForceClearTLS = 0;
 
 /* Configuration (loaded from lua_bridge.ini). */
@@ -798,6 +803,7 @@ static void PumpQueue(void* L_for_exec) {
         ChunkNode* node = InQueuePop();
         if (!node) return;
 
+        g_bridgeExecStartTick = GetTickCount();
         t_inBridgeExec = TRUE;
         if (L_ok) {
             LuaDoString(L_for_exec, node->code, node->len, result_buf, sizeof(result_buf));
@@ -806,6 +812,7 @@ static void PumpQueue(void* L_for_exec) {
                         "[bridge] pump fired without a valid L — chunk dropped");
         }
         t_inBridgeExec = FALSE;
+        g_bridgeExecStartTick = 0;
 
         m2_logf("[+] lua_bridge: Script executed. Result: %s", result_buf);
         OutAppend(result_buf, strlen(result_buf));
@@ -1427,24 +1434,40 @@ static DWORD WINAPI WatchdogThread(LPVOID param) {
         DWORD since_attempt   = now - g_lastPumpAttemptTick;
         DWORD since_progress  = now - g_lastPumpProgressTick;
         DWORD since_last_reset = now - last_reset_tick;
+        DWORD exec_start      = g_bridgeExecStartTick;
+        int   fired           = 0;
+        const char* diag      = NULL;
 
-        /* Not stuck if the game isn't running detours (paused/menu/loading
-         * where luaB_type + CreateTextWidget stop firing). */
-        if (since_detour > 2000) continue;
+        /* Path A — hung-inside-exec: the game thread is blocked inside
+         * LuaDoString (typically a native call from Lua that never returned
+         * — SetSwfFile on a wedged D3D device, an infinite Lua loop, etc.).
+         * When this happens, the same thread that runs our hooked detours
+         * is stuck, so no more detours can fire and the since_detour guard
+         * in Path B would incorrectly bail. Check this first, independent
+         * of detour activity. */
+        if (exec_start != 0 && (now - exec_start) > (DWORD)stuck_ms) {
+            if (last_reset_tick == 0 || since_last_reset >= (DWORD)(stuck_ms / 2)) {
+                diag  = "in-bridge-exec-not-returning (native call from Lua hung)";
+                fired = 1;
+                m2_logf("[!] lua_bridge:   exec_elapsed=%lums",
+                        (unsigned long)(now - exec_start));
+            }
+        }
 
-        /* Not stuck if the pump is actively making progress. */
-        if (since_progress < (DWORD)stuck_ms) continue;
+        /* Path B — detour-visible stuck states: hotWork stuck at 0 or the
+         * pump entering but not draining. Requires detours to have fired
+         * recently to distinguish real stalls from legitimate pauses. */
+        if (!fired) {
+            if (since_detour > 2000) continue;
+            if (since_progress < (DWORD)stuck_ms) continue;
+            if (last_reset_tick != 0 && since_last_reset < (DWORD)(stuck_ms / 2)) continue;
 
-        /* Cool-down after a reset so we give it time to take effect
-         * before hammering again — half the stuck window is plenty. */
-        if (last_reset_tick != 0 && since_last_reset < (DWORD)(stuck_ms / 2)) continue;
-
-        /* Diagnose: which stuck pattern are we seeing? */
-        const char* diag;
-        if (since_attempt > (DWORD)stuck_ms) {
-            diag = "hotWork-stuck-at-0 (GatedPump not entering slow path)";
-        } else {
-            diag = "PumpQueue-not-draining (t_inBridgeExec stuck or L invalid)";
+            if (since_attempt > (DWORD)stuck_ms) {
+                diag = "hotWork-stuck-at-0 (GatedPump not entering slow path)";
+            } else {
+                diag = "PumpQueue-not-draining (t_inBridgeExec stuck or L invalid)";
+            }
+            fired = 1;
         }
 
         m2_logf("[!] lua_bridge: WATCHDOG stuck-state detected — pattern: %s", diag);
@@ -2876,6 +2899,14 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     m2_logf("[*] lua_bridge: key-event sampler armed (~60 Hz, %d-slot ring)",
             KEYEVENT_BUFFER_SIZE);
     if (g_watchdog_stuck_ms > 0) {
+        /* Seed timestamps to "now" so the very first watchdog wake sees
+         * coherent since_X deltas instead of "now - 0" (a huge number that
+         * makes since_progress look like a stall the moment PendingScripts
+         * first goes nonzero). g_bridgeExecStartTick stays 0 = not executing. */
+        DWORD boot_tick = GetTickCount();
+        g_lastDetourFireTick    = boot_tick;
+        g_lastPumpAttemptTick   = boot_tick;
+        g_lastPumpProgressTick  = boot_tick;
         CreateThread(NULL, 0, WatchdogThread, NULL, 0, NULL);
         m2_logf("[*] lua_bridge: watchdog armed (stuck threshold %d ms)",
                 g_watchdog_stuck_ms);
