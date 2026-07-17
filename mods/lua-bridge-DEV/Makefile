@@ -20,7 +20,7 @@ endif
 TARGET      = lua_bridge_DEV.asi
 SRC         = lua_bridge_DEV.c
 CFLAGS      = -O2 -Wall -Wno-unused-function -Wno-unused-variable -static-libgcc -shared -Wl,--enable-stdcall-fixup $(M2_CFLAGS) $(EXTRA_CFLAGS)
-LDFLAGS     = -lws2_32 -lkernel32 -luser32
+LDFLAGS     = -lws2_32 -lkernel32 -luser32 -lbcrypt -lcrypt32
 
 # If the luaL_register hijack is added later via a global assembly
 # file, add it here:

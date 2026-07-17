@@ -55,6 +55,8 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <bcrypt.h>       /* SHA-1 for the WebSocket handshake */
+#include <wincrypt.h>     /* CryptBinaryToStringA — base64 for the same */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -480,6 +482,27 @@ static int   g_loader_onload   = 1;
 static int   g_loader_delay_ms = 50;
 static int   g_loader_onkey_cooldown_ms = 250;  /* per-script re-fire lockout */
 static int   g_watchdog_stuck_ms = 8000;         /* 0 disables the watchdog */
+static int   g_ws_enabled        = 1;            /* 0 disables the WebSocket transport (raw-TCP only) */
+
+/* ------------------------------------------------------------------------ *
+ * WebSocket client tracking (single-client v1 — matches the listener's
+ * existing "one connection at a time" design). When a WS client is
+ * connected, g_wsClient holds the socket; Loader.Printf and Loader.WsSend
+ * fan out to it under g_wsClientMtx. When no WS client is connected,
+ * g_wsClient == INVALID_SOCKET and the fanouts are no-ops. The socket
+ * thread owns connect/disconnect transitions; game-thread fanouts only
+ * read + send under the mutex. ws_send failure inside a fanout means the
+ * client is gone — the socket thread will discover it via recv shortly.
+ * ------------------------------------------------------------------------ */
+static CRITICAL_SECTION g_wsClientMtx;
+static int              g_wsClientMtxInit = 0;
+static SOCKET           g_wsClient        = INVALID_SOCKET;
+
+/* Forward declarations — the loader_lib[] table and LuaLoaderPrintf
+ * reference these; their definitions live in the WebSocket section
+ * further down. */
+static void ws_broadcast_typed_line(const char* type, const char* line, size_t line_len);
+static int  LuaLoaderWsSend(void* L);
 
 /* ------------------------------------------------------------------------ *
  * Output-buffer helpers
@@ -1750,6 +1773,18 @@ static int LuaLoaderPrintf(void* L) {
     EnterCriticalSection(&g_LoaderPrintfMtx);
     WriteFile(g_LoaderPrintfLog, msg, (DWORD)len, &written, NULL);
     LeaveCriticalSection(&g_LoaderPrintfMtx);
+
+    /* Also mirror this line to the connected WS client as
+     * {type:"log",line:"…"} — the live console feed. Strip the trailing
+     * \r\n we appended for the log file; the WS side is line-oriented
+     * on the receiver so we ship the line contents only. No-op if no
+     * WS client is connected. */
+    {
+        size_t body_len = len;
+        if (body_len >= 2 && msg[body_len - 2] == '\r') body_len -= 2;
+        else if (body_len >= 1 && msg[body_len - 1] == '\n') body_len -= 1;
+        ws_broadcast_typed_line("log", msg, body_len);
+    }
     return 0;
 }
 
@@ -2242,6 +2277,7 @@ static int LuaLoaderLoadVar(void* L) {
 
 static const luaL_Reg loader_lib[] = {
     {"Printf",           LuaLoaderPrintf},
+    {"WsSend",           LuaLoaderWsSend},
     {"GetKeyboardState", LuaLoaderGetKeyboardState},
     {"IsKeyDown",        LuaLoaderIsKeyDown},
     {"PopKeyEvents",     LuaLoaderPopKeyEvents},
@@ -2562,6 +2598,648 @@ static void RunPolyfill(void* L) {
 }
 
 /* ------------------------------------------------------------------------ *
+ * WebSocket transport
+ *
+ * A browser can't open raw TCP, but it can open a WebSocket, which is
+ * just an HTTP upgrade + a framed byte stream. The queue/pump/executor
+ * is transport-agnostic, so WS only touches the accept branch and the
+ * output fanout. Raw-TCP clients are unaffected.
+ *
+ * Wire contract (JSON text frames — one message = one request):
+ *   client -> bridge   {"id":"q17abc","code":"<lua source>"}
+ *   bridge -> client   {"type":"ack","id":"q17abc","status":"queued"}
+ *   bridge -> client   {"type":"log","line":"…a Loader.Printf line…"}
+ *   bridge -> client   {"type":"ws","line":"…a Loader.WsSend line…"}
+ *
+ * Results come back via a Lua-side wrapper: the client wraps user code
+ * so that after execution it emits a nonce-tagged line via
+ * Loader.WsSend (the hidden channel — WS-only, never logged). The
+ * client matches its tag on the {type:"ws"} feed. No result-routing
+ * plumbing in C; the id lives in Lua space. Same tag trick tools/
+ * lua_repl.py uses, just off a WS feed instead of the log file.
+ *
+ * Only one WS client (or one raw-TCP client) is served at a time. That
+ * matches the existing listener's design and keeps the fanout trivial:
+ * Loader.Printf / Loader.WsSend check g_wsClient under a mutex and
+ * write to that one socket. Multi-client fanout is a future upgrade.
+ * ------------------------------------------------------------------------ */
+
+/* GUID from RFC 6455 §1.3 — concatenated with the client's key to
+ * derive the Sec-WebSocket-Accept header. */
+#define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+/* Frame opcodes we care about. */
+#define WS_OP_CONT   0x0
+#define WS_OP_TEXT   0x1
+#define WS_OP_BINARY 0x2
+#define WS_OP_CLOSE  0x8
+#define WS_OP_PING   0x9
+#define WS_OP_PONG   0xA
+
+/* Cap for a single incoming WS message. Matches the raw-TCP chunk_buf
+ * (1 MB) so users can send equivalently large chunks. */
+#define WS_MAX_MSG   (1024 * 1024)
+
+/* ------------------------------------------------------------------------ *
+ * SHA-1 via BCrypt (Windows Vista+). The one-shot BCryptHash isn't in
+ * older MinGW bcrypt.h, so use the three-call sequence
+ * (CreateHash → HashData → FinishHash → DestroyHash) which is present
+ * on every bcrypt version.
+ * ------------------------------------------------------------------------ */
+static int ws_sha1(const void* in, size_t in_len, unsigned char out[20]) {
+    BCRYPT_ALG_HANDLE  hAlg  = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    NTSTATUS st;
+    int ok = 0;
+
+    st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA1_ALGORITHM, NULL, 0);
+    if (st < 0 || !hAlg) return 0;
+    st = BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0);
+    if (st < 0 || !hHash) goto out;
+    st = BCryptHashData(hHash, (PUCHAR)in, (ULONG)in_len, 0);
+    if (st < 0) goto out;
+    st = BCryptFinishHash(hHash, out, 20, 0);
+    if (st < 0) goto out;
+    ok = 1;
+out:
+    if (hHash) BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Base64 via CryptBinaryToStringA. For our fixed 20-byte SHA-1 input,
+ * output is exactly 28 chars + NUL — but we pass a big enough buffer
+ * anyway and let the API report the length. NOCRLF because we're
+ * emitting into an HTTP header, not a MIME body.
+ * ------------------------------------------------------------------------ */
+static int ws_base64(const void* in, size_t in_len, char* out, size_t out_cap) {
+    DWORD cchOut = (DWORD)out_cap;
+    if (!CryptBinaryToStringA((const BYTE*)in, (DWORD)in_len,
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                              out, &cchOut)) return 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Blocking send-all wrapper — WS frames are contiguous byte streams;
+ * a short send from the OS means we loop until the whole frame is out
+ * or the socket dies. Returns 1 on full send, 0 on error/disconnect.
+ * ------------------------------------------------------------------------ */
+static int ws_send_all(SOCKET c, const void* buf, size_t len) {
+    const char* p = (const char*)buf;
+    size_t off = 0;
+    while (off < len) {
+        int n = send(c, p + off, (int)(len - off), 0);
+        if (n <= 0) return 0;
+        off += (size_t)n;
+    }
+    return 1;
+}
+
+/* Blocking recv-exact wrapper. Returns 1 on full read, 0 on
+ * error/disconnect. */
+static int ws_recv_all(SOCKET c, void* buf, size_t len) {
+    char* p = (char*)buf;
+    size_t off = 0;
+    while (off < len) {
+        int n = recv(c, p + off, (int)(len - off), 0);
+        if (n <= 0) return 0;
+        off += (size_t)n;
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Send a server frame (unmasked). opcode = WS_OP_TEXT / WS_OP_PONG /
+ * WS_OP_CLOSE. Payload len chooses 7 / 16 / 64-bit length encoding per
+ * RFC 6455 §5.2. Returns 1 on success, 0 on socket error.
+ *
+ * Not thread-safe on its own — WS output paths (server thread, game
+ * thread fanouts) synchronize on g_wsClientMtx before calling this so
+ * two writers can't interleave frame bytes.
+ * ------------------------------------------------------------------------ */
+static int ws_send_frame(SOCKET c, int opcode, const void* payload, size_t len) {
+    unsigned char hdr[14];
+    size_t hdr_len;
+
+    hdr[0] = (unsigned char)(0x80 | (opcode & 0x0F));       /* FIN | opcode */
+
+    if (len < 126) {
+        hdr[1] = (unsigned char)len;
+        hdr_len = 2;
+    } else if (len < 65536) {
+        hdr[1] = 126;
+        hdr[2] = (unsigned char)((len >> 8) & 0xFF);
+        hdr[3] = (unsigned char)(len & 0xFF);
+        hdr_len = 4;
+    } else {
+        uint64_t L = (uint64_t)len;
+        hdr[1] = 127;
+        hdr[2] = (unsigned char)((L >> 56) & 0xFF);
+        hdr[3] = (unsigned char)((L >> 48) & 0xFF);
+        hdr[4] = (unsigned char)((L >> 40) & 0xFF);
+        hdr[5] = (unsigned char)((L >> 32) & 0xFF);
+        hdr[6] = (unsigned char)((L >> 24) & 0xFF);
+        hdr[7] = (unsigned char)((L >> 16) & 0xFF);
+        hdr[8] = (unsigned char)((L >> 8) & 0xFF);
+        hdr[9] = (unsigned char)(L & 0xFF);
+        hdr_len = 10;
+    }
+
+    if (!ws_send_all(c, hdr, hdr_len)) return 0;
+    if (len > 0 && !ws_send_all(c, payload, len)) return 0;
+    return 1;
+}
+
+/* Send a WS text frame. Convenience wrapper. */
+static int ws_send_text(SOCKET c, const void* payload, size_t len) {
+    return ws_send_frame(c, WS_OP_TEXT, payload, len);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Receive one full text message. Assembles continuation frames if any,
+ * auto-handles ping (replies with pong) and close (sends close back
+ * and returns 0). Returns:
+ *   >0 = payload length in bytes (written to out, NUL-terminated)
+ *   0  = connection closed cleanly (client sent close or hit socket EOF)
+ *   -1 = protocol error / malformed frame / oversize
+ * ------------------------------------------------------------------------ */
+static int ws_recv_message(SOCKET c, char* out, size_t out_cap) {
+    size_t total = 0;
+    int    first_opcode = -1;
+
+    for (;;) {
+        unsigned char hdr[2];
+        int    fin;
+        int    opcode;
+        int    masked;
+        size_t plen;
+        unsigned char mask[4];
+
+        if (!ws_recv_all(c, hdr, 2)) return 0;
+        fin    = (hdr[0] & 0x80) != 0;
+        opcode =  hdr[0] & 0x0F;
+        masked = (hdr[1] & 0x80) != 0;
+        plen   =  hdr[1] & 0x7F;
+
+        if (plen == 126) {
+            unsigned char ext[2];
+            if (!ws_recv_all(c, ext, 2)) return 0;
+            plen = ((size_t)ext[0] << 8) | (size_t)ext[1];
+        } else if (plen == 127) {
+            unsigned char ext[8];
+            uint64_t L = 0;
+            int i;
+            if (!ws_recv_all(c, ext, 8)) return 0;
+            for (i = 0; i < 8; ++i) L = (L << 8) | ext[i];
+            if (L > (uint64_t)WS_MAX_MSG) return -1;
+            plen = (size_t)L;
+        }
+
+        /* Per RFC 6455 §5.1, clients MUST mask. Reject unmasked
+         * client frames — the alternative is silent corruption. */
+        if (!masked) return -1;
+        if (!ws_recv_all(c, mask, 4)) return 0;
+
+        /* Control frames (opcode >= 0x8) can be interleaved with a
+         * fragmented data message and have their own payload. Handle
+         * them fully here (auto-pong / close), then continue the loop
+         * to collect the outer data message. */
+        if (opcode >= 0x8) {
+            unsigned char cpl[125];        /* control frames are <= 125 bytes */
+            size_t i;
+            if (plen > sizeof(cpl)) return -1;
+            if (plen > 0 && !ws_recv_all(c, cpl, plen)) return 0;
+            for (i = 0; i < plen; ++i) cpl[i] ^= mask[i & 3];
+
+            if (opcode == WS_OP_PING) {
+                EnterCriticalSection(&g_wsClientMtx);
+                ws_send_frame(c, WS_OP_PONG, cpl, plen);
+                LeaveCriticalSection(&g_wsClientMtx);
+                continue;
+            }
+            if (opcode == WS_OP_CLOSE) {
+                EnterCriticalSection(&g_wsClientMtx);
+                ws_send_frame(c, WS_OP_CLOSE, cpl, plen);  /* echo back per §5.5.1 */
+                LeaveCriticalSection(&g_wsClientMtx);
+                return 0;
+            }
+            /* WS_OP_PONG: nothing to do — we never originate pings. */
+            continue;
+        }
+
+        /* Data frame. First fragment sets the opcode; continuations
+         * must use WS_OP_CONT. */
+        if (first_opcode == -1) {
+            first_opcode = opcode;
+            if (opcode != WS_OP_TEXT && opcode != WS_OP_BINARY) return -1;
+        } else {
+            if (opcode != WS_OP_CONT) return -1;
+        }
+
+        if (plen > 0) {
+            size_t i;
+            if (total + plen >= out_cap) return -1;
+            if (!ws_recv_all(c, out + total, plen)) return 0;
+            for (i = 0; i < plen; ++i) out[total + i] ^= mask[i & 3];
+            total += plen;
+        }
+
+        if (fin) {
+            out[total] = '\0';
+            return (int)total;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------ *
+ * Handshake: parse an HTTP GET, extract Sec-WebSocket-Key, respond
+ * with 101 Switching Protocols. `peek` holds bytes already read from
+ * the socket (up to peek_len); everything up through the terminating
+ * "\r\n\r\n" must be present or we bail. Returns 1 on 101 sent, 0 on
+ * malformed / not a WS upgrade / socket error.
+ * ------------------------------------------------------------------------ */
+static int ws_do_handshake(SOCKET c, const char* peek, size_t peek_len) {
+    char req[8192];
+    size_t rlen = 0;
+    const char* key_hdr;
+    const char* key_start;
+    const char* key_end;
+    char key[128];
+    size_t key_len;
+    unsigned char sha[20];
+    char accept[64];
+    char concat[256];
+    size_t concat_len;
+    char resp[512];
+    int resp_len;
+
+    /* Seed the request buffer with what's already been peeked, then
+     * read the rest up to \r\n\r\n. */
+    if (peek_len >= sizeof(req)) return 0;
+    memcpy(req, peek, peek_len);
+    rlen = peek_len;
+
+    while (rlen + 1 < sizeof(req)) {
+        int n;
+        req[rlen] = '\0';
+        if (rlen >= 4 && strstr(req, "\r\n\r\n")) break;
+        n = recv(c, req + rlen, (int)(sizeof(req) - rlen - 1), 0);
+        if (n <= 0) return 0;
+        rlen += (size_t)n;
+    }
+    req[rlen] = '\0';
+
+    /* Locate the Sec-WebSocket-Key header (case-insensitive per RFC
+     * 2616; we use _strnicmp for a simple substring pass). */
+    {
+        const char* p = req;
+        const char* needle = "Sec-WebSocket-Key:";
+        size_t nlen = strlen(needle);
+        key_hdr = NULL;
+        while (*p) {
+            if (_strnicmp(p, needle, nlen) == 0) { key_hdr = p + nlen; break; }
+            while (*p && *p != '\n') p++;
+            if (*p == '\n') p++;
+        }
+        if (!key_hdr) return 0;
+    }
+    while (*key_hdr == ' ' || *key_hdr == '\t') key_hdr++;
+    key_start = key_hdr;
+    key_end = key_start;
+    while (*key_end && *key_end != '\r' && *key_end != '\n') key_end++;
+    key_len = (size_t)(key_end - key_start);
+    if (key_len == 0 || key_len >= sizeof(key)) return 0;
+    memcpy(key, key_start, key_len);
+    key[key_len] = '\0';
+
+    /* Sec-WebSocket-Accept = base64(sha1(key + WS_GUID)) */
+    concat_len = key_len + strlen(WS_GUID);
+    if (concat_len >= sizeof(concat)) return 0;
+    memcpy(concat, key, key_len);
+    memcpy(concat + key_len, WS_GUID, strlen(WS_GUID));
+    if (!ws_sha1(concat, concat_len, sha)) return 0;
+    if (!ws_base64(sha, 20, accept, sizeof(accept))) return 0;
+
+    resp_len = _snprintf_s(resp, sizeof(resp), _TRUNCATE,
+                           "HTTP/1.1 101 Switching Protocols\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Accept: %s\r\n"
+                           "\r\n",
+                           accept);
+    if (resp_len <= 0) return 0;
+    return ws_send_all(c, resp, (size_t)resp_len);
+}
+
+/* ------------------------------------------------------------------------ *
+ * JSON — minimal helpers, scoped to exactly what the wire contract
+ * needs. Not a full parser: we look up two known string keys ("id",
+ * "code") and unescape their values; nothing else is exercised.
+ * ------------------------------------------------------------------------ */
+
+/* Skip JSON whitespace at *p (advances the pointer in-place). */
+static void js_skip_ws(const char** p, const char* end) {
+    while (*p < end) {
+        char ch = **p;
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') (*p)++;
+        else return;
+    }
+}
+
+/* Parse a JSON string starting at **p (must be pointing at '"').
+ * Writes unescaped bytes to out (up to out_cap-1), NUL-terminates, and
+ * advances *p to just past the closing quote. Returns bytes written,
+ * or -1 on malformed / overflow. Handles \" \\ \/ \n \r \t \b \f and
+ * \uXXXX for basic Latin (>0xFF is transcoded to '?' — the bridge
+ * doesn't need Unicode fidelity for our two fields). */
+static int js_parse_string(const char** p, const char* end, char* out, size_t out_cap) {
+    size_t o = 0;
+    if (*p >= end || **p != '"') return -1;
+    (*p)++;
+    while (*p < end) {
+        char ch = **p;
+        if (ch == '"') { (*p)++; if (o < out_cap) out[o] = '\0'; return (int)o; }
+        if (ch == '\\') {
+            (*p)++;
+            if (*p >= end) return -1;
+            {
+                char esc = **p;
+                (*p)++;
+                if (o + 1 >= out_cap) return -1;
+                switch (esc) {
+                    case '"':  out[o++] = '"';  break;
+                    case '\\': out[o++] = '\\'; break;
+                    case '/':  out[o++] = '/';  break;
+                    case 'n':  out[o++] = '\n'; break;
+                    case 'r':  out[o++] = '\r'; break;
+                    case 't':  out[o++] = '\t'; break;
+                    case 'b':  out[o++] = '\b'; break;
+                    case 'f':  out[o++] = '\f'; break;
+                    case 'u': {
+                        unsigned int v = 0;
+                        int i;
+                        if (*p + 4 > end) return -1;
+                        for (i = 0; i < 4; ++i) {
+                            char h = (*p)[i];
+                            v <<= 4;
+                            if (h >= '0' && h <= '9') v |= (h - '0');
+                            else if (h >= 'a' && h <= 'f') v |= (h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') v |= (h - 'A' + 10);
+                            else return -1;
+                        }
+                        (*p) += 4;
+                        out[o++] = (v <= 0xFF) ? (char)v : '?';
+                        break;
+                    }
+                    default: return -1;
+                }
+            }
+        } else {
+            if (o + 1 >= out_cap) return -1;
+            out[o++] = ch;
+            (*p)++;
+        }
+    }
+    return -1;
+}
+
+/* Extract id and code from {"id":"…","code":"…"}. Whitespace-tolerant.
+ * Non-string fields and other keys are silently skipped. Returns 1 on
+ * success (both fields found), 0 otherwise. */
+static int ws_parse_request(const char* body, size_t body_len,
+                            char* id_out, size_t id_cap,
+                            char* code_out, size_t code_cap) {
+    const char* p   = body;
+    const char* end = body + body_len;
+    int have_id = 0, have_code = 0;
+
+    js_skip_ws(&p, end);
+    if (p >= end || *p != '{') return 0;
+    p++;
+
+    for (;;) {
+        char key[32];
+        int kl;
+
+        js_skip_ws(&p, end);
+        if (p >= end) return 0;
+        if (*p == '}') { p++; break; }
+
+        kl = js_parse_string(&p, end, key, sizeof(key));
+        if (kl < 0) return 0;
+        js_skip_ws(&p, end);
+        if (p >= end || *p != ':') return 0;
+        p++;
+        js_skip_ws(&p, end);
+
+        if (strcmp(key, "id") == 0) {
+            int r = js_parse_string(&p, end, id_out, id_cap);
+            if (r < 0) return 0;
+            have_id = 1;
+        } else if (strcmp(key, "code") == 0) {
+            int r = js_parse_string(&p, end, code_out, code_cap);
+            if (r < 0) return 0;
+            have_code = 1;
+        } else {
+            /* Skip an unknown value. We only need strings in practice,
+             * but handle numbers / booleans / null defensively. */
+            if (*p == '"') {
+                char sink[256];
+                if (js_parse_string(&p, end, sink, sizeof(sink)) < 0) return 0;
+            } else {
+                while (p < end && *p != ',' && *p != '}') p++;
+            }
+        }
+
+        js_skip_ws(&p, end);
+        if (p >= end) return 0;
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') { p++; break; }
+        return 0;
+    }
+
+    return have_id && have_code;
+}
+
+/* Escape a string into JSON: outputs to *dst (advanced in-place) up to
+ * dst_end. Backslash / quote / control chars are escaped per RFC 8259.
+ * Non-ASCII bytes are passed through raw (the wire is UTF-8; the
+ * upstream data is already valid UTF-8 in practice — Loader.Printf
+ * output is ASCII/Latin plus whatever mods pass through). Returns 1
+ * on success, 0 on buffer overflow. */
+static int js_escape_into(const char* src, size_t src_len, char** dst, char* dst_end) {
+    size_t i;
+    char* d = *dst;
+    for (i = 0; i < src_len; ++i) {
+        unsigned char ch = (unsigned char)src[i];
+        if (ch == '\\' || ch == '"') {
+            if (d + 2 > dst_end) return 0;
+            *d++ = '\\'; *d++ = (char)ch;
+        } else if (ch == '\n') { if (d + 2 > dst_end) return 0; *d++ = '\\'; *d++ = 'n'; }
+          else if (ch == '\r') { if (d + 2 > dst_end) return 0; *d++ = '\\'; *d++ = 'r'; }
+          else if (ch == '\t') { if (d + 2 > dst_end) return 0; *d++ = '\\'; *d++ = 't'; }
+          else if (ch == '\b') { if (d + 2 > dst_end) return 0; *d++ = '\\'; *d++ = 'b'; }
+          else if (ch == '\f') { if (d + 2 > dst_end) return 0; *d++ = '\\'; *d++ = 'f'; }
+          else if (ch < 0x20) {
+            if (d + 6 > dst_end) return 0;
+            _snprintf_s(d, 7, _TRUNCATE, "\\u%04x", ch);
+            d += 6;
+        } else {
+            if (d + 1 > dst_end) return 0;
+            *d++ = (char)ch;
+        }
+    }
+    *dst = d;
+    return 1;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Broadcast helpers — called from the game thread inside Loader.Printf
+ * and Loader.WsSend. Both take g_wsClientMtx (which also serializes
+ * frame writes against the socket thread's own sends). If no client is
+ * connected, no-op. If send fails, close the socket immediately so
+ * the server thread's recv sees EOF and clears g_wsClient properly.
+ * ------------------------------------------------------------------------ */
+static void ws_broadcast_typed_line(const char* type, const char* line, size_t line_len) {
+    char buf[2560];              /* enough for a full 2 KB Loader.Printf line + envelope */
+    char* d = buf;
+    char* de = buf + sizeof(buf);
+    size_t prefix_len;
+    size_t suffix_len;
+    const char* prefix_a = "{\"type\":\"";
+    const char* prefix_b = "\",\"line\":\"";
+    const char* suffix   = "\"}";
+    SOCKET s;
+
+    /* Fast bail before we do any work if no WS client is connected. */
+    if (!g_wsClientMtxInit) return;
+    EnterCriticalSection(&g_wsClientMtx);
+    s = g_wsClient;
+    if (s == INVALID_SOCKET) { LeaveCriticalSection(&g_wsClientMtx); return; }
+
+    prefix_len = strlen(prefix_a);
+    if (d + prefix_len > de) goto out;
+    memcpy(d, prefix_a, prefix_len); d += prefix_len;
+
+    {
+        size_t tlen = strlen(type);
+        if (d + tlen > de) goto out;
+        memcpy(d, type, tlen); d += tlen;
+    }
+
+    prefix_len = strlen(prefix_b);
+    if (d + prefix_len > de) goto out;
+    memcpy(d, prefix_b, prefix_len); d += prefix_len;
+
+    if (!js_escape_into(line, line_len, &d, de)) goto out;
+
+    suffix_len = strlen(suffix);
+    if (d + suffix_len > de) goto out;
+    memcpy(d, suffix, suffix_len); d += suffix_len;
+
+    if (!ws_send_text(s, buf, (size_t)(d - buf))) {
+        /* Send failed — client disconnected mid-write. Close the
+         * socket so the server thread's recv wakes up. */
+        closesocket(s);
+        g_wsClient = INVALID_SOCKET;
+    }
+
+out:
+    LeaveCriticalSection(&g_wsClientMtx);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Loader.WsSend(str, ...) — the HIDDEN channel. Same join semantics as
+ * Loader.Printf (tab-separated string args), but NEVER writes the log
+ * file. Broadcasts each call as {type:"ws",line:"…"} to the connected
+ * WS client if any; no-op otherwise. This is what tagged results ride
+ * on: the client wraps user code so the tagged reply lands here,
+ * invisible to lua_loader_printf.log.
+ * ------------------------------------------------------------------------ */
+static int LuaLoaderWsSend(void* L) {
+    char msg[2048];
+    int  joined = m2_lua_join_strings(L, msg, (int)sizeof(msg) - 2);
+    if (joined <= 0) return 0;
+    ws_broadcast_typed_line("ws", msg, strlen(msg));
+    return 0;
+}
+
+/* ------------------------------------------------------------------------ *
+ * WS session loop. One WS client at a time. Receives JSON messages,
+ * parses {id, code}, queues code, sends the ack immediately, then
+ * loops. Log/ws-send fanout happens on the game thread via
+ * ws_broadcast_typed_line — this thread only handles the input side.
+ *
+ * The pump path's result_buf still appends to g_outBuf (the raw-TCP
+ * output channel) but we don't forward that to the WS client (result
+ * routing goes via Loader.WsSend from the Lua wrapper). We do drain
+ * g_outBuf silently so it can't grow unbounded across many chunks.
+ * ------------------------------------------------------------------------ */
+static void ws_serve_client(SOCKET c) {
+    char msg[WS_MAX_MSG];
+    char id[128];
+    char* code = NULL;
+    const size_t code_cap = WS_MAX_MSG;
+
+    code = (char*)malloc(code_cap);
+    if (!code) { m2_logf("[!] lua_bridge: ws: OOM allocating code buffer"); return; }
+
+    EnterCriticalSection(&g_wsClientMtx);
+    g_wsClient = c;
+    LeaveCriticalSection(&g_wsClientMtx);
+    m2_logf("[*] lua_bridge: ws: client connected");
+
+    for (;;) {
+        int r;
+        char ack[192];
+        int  ack_len;
+
+        /* Discard any pending raw-TCP output that accumulated during
+         * this session — the WS client uses Loader.WsSend for results,
+         * not the raw-TCP result_buf. Prevents unbounded growth of
+         * g_outBuf across long WS sessions. */
+        EnterCriticalSection(&g_outMtx);
+        if (g_outBuf_len > 0) {
+            g_outBuf_len = 0;
+            if (g_outBuf) g_outBuf[0] = '\0';
+        }
+        LeaveCriticalSection(&g_outMtx);
+
+        r = ws_recv_message(c, msg, sizeof(msg));
+        if (r <= 0) break;                        /* clean close or error */
+
+        id[0] = '\0';
+        code[0] = '\0';
+        if (!ws_parse_request(msg, (size_t)r, id, sizeof(id), code, code_cap)) {
+            m2_logf("[!] lua_bridge: ws: rejected malformed request (%d bytes)", r);
+            continue;
+        }
+
+        InQueuePush(code, strlen(code));
+        m2_logf("[+] lua_bridge: ws: queued chunk (id=%s, %zu bytes)", id, strlen(code));
+
+        ack_len = _snprintf_s(ack, sizeof(ack), _TRUNCATE,
+                              "{\"type\":\"ack\",\"id\":\"%s\",\"status\":\"queued\"}", id);
+        if (ack_len > 0) {
+            EnterCriticalSection(&g_wsClientMtx);
+            if (!ws_send_text(c, ack, (size_t)ack_len)) {
+                LeaveCriticalSection(&g_wsClientMtx);
+                break;
+            }
+            LeaveCriticalSection(&g_wsClientMtx);
+        }
+    }
+
+    EnterCriticalSection(&g_wsClientMtx);
+    if (g_wsClient == c) g_wsClient = INVALID_SOCKET;
+    LeaveCriticalSection(&g_wsClientMtx);
+    m2_logf("[*] lua_bridge: ws: client disconnected");
+    free(code);
+}
+
+/* ------------------------------------------------------------------------ *
  * TCP REPL server
  *
  * Protocol (matches tools/lua_repl.py and tools/lua_console.py in the
@@ -2574,6 +3252,11 @@ static void RunPolyfill(void* L) {
  *   - Whenever a pump source fires, the queued chunk runs against the
  *     captured L. The result is written back as one or more lines,
  *     followed by a line containing "<<<END>>>".
+ *
+ * When g_ws_enabled=1 (the default), the first bytes of each accepted
+ * connection are peeked. If they start with "GET ", the connection is
+ * upgraded to WebSocket via ws_do_handshake + ws_serve_client. Anything
+ * else falls through to the raw-TCP loop below, unchanged.
  * ------------------------------------------------------------------------ */
 #define BRIDGE_SENTINEL   "<<<RUN>>>"
 #define BRIDGE_END_MARKER "<<<END>>>"
@@ -2624,6 +3307,38 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
 
         c = accept(srv, NULL, NULL);
         if (c == INVALID_SOCKET) continue;
+
+        /* Discard any pending raw-TCP output that leaked in from a
+         * previous session. The bridge is single-client, so anything
+         * in g_outBuf at accept-time is stale — most commonly the
+         * result_buf of a chunk a WS client queued then disconnected
+         * before its pump run. Cross-session leakage would confuse a
+         * fresh raw-TCP client that expects its first byte to be its
+         * own [queued] ack. */
+        EnterCriticalSection(&g_outMtx);
+        if (g_outBuf_len > 0) {
+            g_outBuf_len = 0;
+            if (g_outBuf) g_outBuf[0] = '\0';
+        }
+        LeaveCriticalSection(&g_outMtx);
+
+        /* WebSocket peek-and-branch. MSG_PEEK doesn't consume the bytes,
+         * so on a match ws_do_handshake starts fresh recv()s that see
+         * the full request. Non-match falls through to the raw-TCP
+         * loop below with an untouched socket buffer. */
+        if (g_ws_enabled) {
+            char wsPeek[16];
+            int  pn = recv(c, wsPeek, (int)sizeof(wsPeek), MSG_PEEK);
+            if (pn >= 4 && memcmp(wsPeek, "GET ", 4) == 0) {
+                if (ws_do_handshake(c, NULL, 0)) {
+                    ws_serve_client(c);
+                } else {
+                    m2_logf("[!] lua_bridge: ws: handshake failed");
+                }
+                closesocket(c);
+                continue;
+            }
+        }
 
         for (;;) {
             /* Flush pending output */
@@ -2727,6 +3442,8 @@ static void OnIniKV(void* ud, const char* key, const char* value) {
     } else if (_stricmp(key, "watchdog_stuck_ms") == 0) {
         g_watchdog_stuck_ms = atoi(value);
         if (g_watchdog_stuck_ms < 0) g_watchdog_stuck_ms = 0;
+    } else if (_stricmp(key, "websocket_enabled") == 0) {
+        g_ws_enabled = atoi(value);
     }
 }
 
@@ -2772,7 +3489,16 @@ static const char kDefaultIni[] =
     "; a background thread force-resets the bridge's stuck-state candidates\n"
     "; (hotWork, t_inBridgeExec, g_LuaState, seen-set) and logs a comprehensive\n"
     "; diagnostic line. Set to 0 to disable the watchdog entirely.\n"
-    "watchdog_stuck_ms = 8000\n";
+    "watchdog_stuck_ms = 8000\n"
+    "\n"
+    "; WebSocket transport (1 = enabled, 0 = disabled). When enabled, the same\n"
+    "; listener speaks either raw TCP (existing lua_repl.py / lua_console.py\n"
+    "; protocol) or WebSocket — auto-detected from the first bytes. Browser\n"
+    "; clients (tools/ess-bridge.js) connect via WS and receive structured\n"
+    "; JSON messages: {type:\"ack\"}, {type:\"log\"} (mirrors Loader.Printf),\n"
+    "; and {type:\"ws\"} (the hidden Loader.WsSend channel). Disable this if\n"
+    "; you want the bridge locked to raw-TCP only.\n"
+    "websocket_enabled = 1\n";
 
 static void EnsureIniDefault(const char* path) {
     FILE* f = fopen(path, "r");
@@ -2894,6 +3620,15 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
         return 0;
     }
 
+    /* Initialize the WS-client mutex before spawning any thread that
+     * might touch g_wsClient (the server thread updates it on
+     * connect/disconnect; game-thread Loader.Printf/WsSend read it
+     * for fanout). Safe to always init even when g_ws_enabled=0 — the
+     * mutex is cheap and the fanout still checks g_wsClient itself. */
+    if (!g_wsClientMtxInit) {
+        InitializeCriticalSection(&g_wsClientMtx);
+        g_wsClientMtxInit = 1;
+    }
     CreateThread(NULL, 0, BridgeServerThread, NULL, 0, NULL);
     CreateThread(NULL, 0, LoaderKeyEventThread, NULL, 0, NULL);
     m2_logf("[*] lua_bridge: key-event sampler armed (~60 Hz, %d-slot ring)",

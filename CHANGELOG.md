@@ -2,6 +2,31 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.4.0] - 2026-07-17
+
+Only `lua-bridge-DEV` bumped (0.3.1 → 0.4.0). Version-family boundary: `v0.4` adds a **WebSocket transport** alongside the existing raw-TCP one, which unlocks a whole new class of client — a browser can now connect directly to the live game and drive Lua without a Python/PowerShell relay in the middle. Also adds a new Lua function for pushing values back out on a hidden channel.
+
+### Added
+
+- **WebSocket transport.** The same listener (`127.0.0.1:27050` by default) now speaks either raw TCP (the existing `lua_repl.py` / `lua_console.py` protocol) or WebSocket, auto-detected from the first bytes of each connection. Peek for `GET ` → WebSocket handshake (RFC 6455, SHA-1 via BCrypt + base64 via `CryptBinaryToStringA` — no vendored crypto); anything else falls through to the raw-TCP path unchanged. Wire contract is JSON text frames:
+  ```
+  client -> bridge   {"id":"q17abc","code":"<lua source>"}
+  bridge -> client   {"type":"ack","id":"q17abc","status":"queued"}
+  bridge -> client   {"type":"log","line":"…a Loader.Printf line…"}
+  bridge -> client   {"type":"ws","line":"…a Loader.WsSend line…"}
+  ```
+  One WS message = one request. Ack is immediate (socket thread, deterministic). Log and WsSend feeds mirror in real time. Ping/pong and close frames are handled per spec. Frame sizes up to 1 MB per message, matching the raw-TCP chunk cap. Reference browser client lives in [`mercs2-lua-essentials/tools/ess-bridge.js`](https://github.com/loganw234/mercs2-lua-essentials).
+- **`Loader.WsSend(str, …)`** — a new Lua global that broadcasts each call as `{"type":"ws","line":"…"}` to the connected WebSocket client **and never writes the log file**. Same join semantics as `Loader.Printf` (tab-separated string args). This is the "hidden channel" — REPL result plumbing (tagged nonces from the client-side wrapper) rides it without polluting `lua_loader_printf.log`, and mods can stream telemetry to a browser page without dumping it into the log too. No-op when no WS client is connected, so scripts that call it under raw-TCP or offline are harmless.
+- **INI toggle** `websocket_enabled = 1` (default on). Rollback lever — set to 0 to disable the WS transport entirely and lock the listener to raw-TCP only.
+
+### Changed
+
+- `Loader.Printf` still writes to `lua_loader_printf.log` exactly as before, but now also mirrors each line to the connected WS client as `{"type":"log","line":"…"}`. This is the browser's "live console feed." Raw-TCP behavior is unaffected — Printf never wrote to that path in the first place, and doesn't now.
+
+### Fixed
+
+- **Cross-session `g_outBuf` leakage.** The single-client output buffer used by the raw-TCP path could carry stale content from a previous session — most commonly the executor's `result_buf` for a chunk a WS client queued and then disconnected before its pump run. A fresh raw-TCP client's first read would then contain that stale result before its own `[queued]` ack. Now cleared at accept-time on every new raw-TCP session and drained continuously during WS sessions, so no output can survive across session boundaries.
+
 ## [v0.3.1] - 2026-07-15
 
 Only `lua-bridge-DEV` bumped (0.3.0 → 0.3.1). Watchdog reliability patch — no user-facing API changes.
