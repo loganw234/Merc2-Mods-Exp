@@ -409,10 +409,20 @@ static char*  g_outBuf       = NULL;
 static size_t g_outBuf_len   = 0;
 static size_t g_outBuf_cap   = 0;
 
-/* Input queue — pending chunks waiting for a pump source to fire. */
+/* Input queue — pending chunks waiting for a pump source to fire.
+ * `from_ws` = 1 means the chunk was queued by a WebSocket client, which
+ * receives its results via Loader.WsSend on the {type:"ws"} broadcast
+ * channel (result routing lives in Lua-space via the client-side tag).
+ * The pump skips the g_outBuf writes for these — g_outBuf is the raw-TCP
+ * result channel, and a WS-queued chunk's result flooding it would be
+ * seen as unsolicited output by any concurrently-connected raw-TCP
+ * client. from_ws=0 covers raw-TCP submissions and loader-initiated
+ * OnKey/OnBoot/OnLoad scripts (both still write results to g_outBuf,
+ * matching the prior v0.4.0 behavior). */
 typedef struct ChunkNode {
     char*  code;
     size_t len;
+    int    from_ws;
     struct ChunkNode* next;
 } ChunkNode;
 static CRITICAL_SECTION g_inMtx;
@@ -485,18 +495,21 @@ static int   g_watchdog_stuck_ms = 8000;         /* 0 disables the watchdog */
 static int   g_ws_enabled        = 1;            /* 0 disables the WebSocket transport (raw-TCP only) */
 
 /* ------------------------------------------------------------------------ *
- * WebSocket client tracking (single-client v1 — matches the listener's
- * existing "one connection at a time" design). When a WS client is
- * connected, g_wsClient holds the socket; Loader.Printf and Loader.WsSend
- * fan out to it under g_wsClientMtx. When no WS client is connected,
- * g_wsClient == INVALID_SOCKET and the fanouts are no-ops. The socket
- * thread owns connect/disconnect transitions; game-thread fanouts only
- * read + send under the mutex. ws_send failure inside a fanout means the
- * client is gone — the socket thread will discover it via recv shortly.
+ * WebSocket client tracking. Multiple concurrent WS clients: each gets
+ * its own worker thread running ws_serve_client, and adds/removes itself
+ * from g_wsClients[] under g_wsClientMtx. Broadcasters (Loader.Printf
+ * and Loader.WsSend fanouts on the game thread) iterate the list and
+ * fan out; a send failure prunes the dead client in place. Send calls
+ * to a given socket are serialized by the same mutex — briefly held
+ * for the duration of one frame's byte stream so two writers can't
+ * interleave. Cap chosen high enough for realistic use (a browser tab
+ * or two + a REPL + a debug page + slack) with negligible cost.
  * ------------------------------------------------------------------------ */
+#define WS_MAX_CLIENTS 16
 static CRITICAL_SECTION g_wsClientMtx;
 static int              g_wsClientMtxInit = 0;
-static SOCKET           g_wsClient        = INVALID_SOCKET;
+static SOCKET           g_wsClients[WS_MAX_CLIENTS];
+static int              g_wsClientCount = 0;
 
 /* Forward declarations — the loader_lib[] table and LuaLoaderPrintf
  * reference these; their definitions live in the WebSocket section
@@ -530,15 +543,16 @@ static void OutAppend(const char* s, size_t s_len) {
 /* ------------------------------------------------------------------------ *
  * Input-queue helpers
  * ------------------------------------------------------------------------ */
-static void InQueuePush(const char* code, size_t len) {
+static void InQueuePush(const char* code, size_t len, int from_ws) {
     ChunkNode* node = (ChunkNode*)malloc(sizeof(ChunkNode));
     if (!node) return;
     node->code = (char*)malloc(len + 1);
     if (!node->code) { free(node); return; }
     memcpy(node->code, code, len);
     node->code[len] = '\0';
-    node->len  = len;
-    node->next = NULL;
+    node->len     = len;
+    node->from_ws = from_ws;
+    node->next    = NULL;
 
     EnterCriticalSection(&g_inMtx);
     if (g_inQueue_tail) g_inQueue_tail->next = node;
@@ -838,8 +852,15 @@ static void PumpQueue(void* L_for_exec) {
         g_bridgeExecStartTick = 0;
 
         m2_logf("[+] lua_bridge: Script executed. Result: %s", result_buf);
-        OutAppend(result_buf, strlen(result_buf));
-        OutAppend("<<<END>>>", 9);
+        /* Only fan out to the raw-TCP result channel (g_outBuf) for
+         * chunks that came from raw TCP or the loader. WS-queued
+         * chunks return their results via Loader.WsSend from the Lua
+         * wrapper; writing to g_outBuf here would spray them at any
+         * concurrently-connected raw-TCP client as unsolicited noise. */
+        if (!node->from_ws) {
+            OutAppend(result_buf, strlen(result_buf));
+            OutAppend("<<<END>>>", 9);
+        }
         ChunkNodeFree(node);
 
         /* Watchdog telemetry: successful drain proves the pump path is
@@ -1612,9 +1633,9 @@ static DWORD WINAPI LoaderKeyThread(LPVOID param) {
                                     size_t read_bytes = fread(buf, 1, sz, f);
                                     buf[read_bytes] = '\0';
                                     
-                                    m2_logf("[*] lua_bridge: OnKey hotkey '%s' pressed. Queuing script %s", 
+                                    m2_logf("[*] lua_bridge: OnKey hotkey '%s' pressed. Queuing script %s",
                                             g_KeyScripts[i].key_name, g_KeyScripts[i].rel_path);
-                                    InQueuePush(buf, read_bytes);
+                                    InQueuePush(buf, read_bytes, 0);
                                     
                                     free(buf);
                                 }
@@ -3096,11 +3117,43 @@ static int js_escape_into(const char* src, size_t src_len, char** dst, char* dst
 }
 
 /* ------------------------------------------------------------------------ *
- * Broadcast helpers — called from the game thread inside Loader.Printf
- * and Loader.WsSend. Both take g_wsClientMtx (which also serializes
- * frame writes against the socket thread's own sends). If no client is
- * connected, no-op. If send fails, close the socket immediately so
- * the server thread's recv sees EOF and clears g_wsClient properly.
+ * Client-list helpers. Add/remove under g_wsClientMtx; the broadcaster
+ * iterates the same list and prunes on send failure. Called from the
+ * per-client worker thread on entry/exit.
+ * ------------------------------------------------------------------------ */
+static int ws_add_client(SOCKET c) {
+    int ok = 0;
+    EnterCriticalSection(&g_wsClientMtx);
+    if (g_wsClientCount < WS_MAX_CLIENTS) {
+        g_wsClients[g_wsClientCount++] = c;
+        ok = 1;
+    }
+    LeaveCriticalSection(&g_wsClientMtx);
+    return ok;
+}
+
+static void ws_remove_client(SOCKET c) {
+    int i;
+    EnterCriticalSection(&g_wsClientMtx);
+    for (i = 0; i < g_wsClientCount; ++i) {
+        if (g_wsClients[i] == c) {
+            g_wsClients[i] = g_wsClients[--g_wsClientCount];   /* swap-remove */
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_wsClientMtx);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Broadcast — called from the game thread inside Loader.Printf and
+ * Loader.WsSend. Build the JSON envelope once (outside the lock), then
+ * fan out to every connected client. Send failure means the client is
+ * gone; close the socket and swap-remove it from the list so the next
+ * broadcast doesn't hit it. The per-client worker thread's recv will
+ * see the close on its next iteration and exit cleanly.
+ *
+ * Iterating in reverse means a swap-remove doesn't skip an entry —
+ * we visit each index at most once regardless of what gets pruned.
  * ------------------------------------------------------------------------ */
 static void ws_broadcast_typed_line(const char* type, const char* line, size_t line_len) {
     char buf[2560];              /* enough for a full 2 KB Loader.Printf line + envelope */
@@ -3111,42 +3164,43 @@ static void ws_broadcast_typed_line(const char* type, const char* line, size_t l
     const char* prefix_a = "{\"type\":\"";
     const char* prefix_b = "\",\"line\":\"";
     const char* suffix   = "\"}";
-    SOCKET s;
+    size_t buf_len;
+    int i;
 
-    /* Fast bail before we do any work if no WS client is connected. */
     if (!g_wsClientMtxInit) return;
-    EnterCriticalSection(&g_wsClientMtx);
-    s = g_wsClient;
-    if (s == INVALID_SOCKET) { LeaveCriticalSection(&g_wsClientMtx); return; }
 
+    /* Build once, unlocked. */
     prefix_len = strlen(prefix_a);
-    if (d + prefix_len > de) goto out;
+    if (d + prefix_len > de) return;
     memcpy(d, prefix_a, prefix_len); d += prefix_len;
 
     {
         size_t tlen = strlen(type);
-        if (d + tlen > de) goto out;
+        if (d + tlen > de) return;
         memcpy(d, type, tlen); d += tlen;
     }
 
     prefix_len = strlen(prefix_b);
-    if (d + prefix_len > de) goto out;
+    if (d + prefix_len > de) return;
     memcpy(d, prefix_b, prefix_len); d += prefix_len;
 
-    if (!js_escape_into(line, line_len, &d, de)) goto out;
+    if (!js_escape_into(line, line_len, &d, de)) return;
 
     suffix_len = strlen(suffix);
-    if (d + suffix_len > de) goto out;
+    if (d + suffix_len > de) return;
     memcpy(d, suffix, suffix_len); d += suffix_len;
 
-    if (!ws_send_text(s, buf, (size_t)(d - buf))) {
-        /* Send failed — client disconnected mid-write. Close the
-         * socket so the server thread's recv wakes up. */
-        closesocket(s);
-        g_wsClient = INVALID_SOCKET;
-    }
+    buf_len = (size_t)(d - buf);
 
-out:
+    /* Fan out. */
+    EnterCriticalSection(&g_wsClientMtx);
+    for (i = g_wsClientCount - 1; i >= 0; --i) {
+        SOCKET s = g_wsClients[i];
+        if (!ws_send_text(s, buf, buf_len)) {
+            closesocket(s);
+            g_wsClients[i] = g_wsClients[--g_wsClientCount];   /* swap-remove */
+        }
+    }
     LeaveCriticalSection(&g_wsClientMtx);
 }
 
@@ -3167,15 +3221,16 @@ static int LuaLoaderWsSend(void* L) {
 }
 
 /* ------------------------------------------------------------------------ *
- * WS session loop. One WS client at a time. Receives JSON messages,
- * parses {id, code}, queues code, sends the ack immediately, then
- * loops. Log/ws-send fanout happens on the game thread via
- * ws_broadcast_typed_line — this thread only handles the input side.
+ * Per-client session loop. Receives JSON messages, parses {id, code},
+ * queues the code as a WS-provenance chunk, sends the immediate ack
+ * directly on this socket, then loops. Log/ws-send fanout happens on
+ * the game thread via ws_broadcast_typed_line — this thread only
+ * handles input + acks. On disconnect / bad frame / send error, the
+ * wrapper (WsClientThread) does the cleanup.
  *
- * The pump path's result_buf still appends to g_outBuf (the raw-TCP
- * output channel) but we don't forward that to the WS client (result
- * routing goes via Loader.WsSend from the Lua wrapper). We do drain
- * g_outBuf silently so it can't grow unbounded across many chunks.
+ * The pump doesn't OutAppend for WS-queued chunks (see the from_ws
+ * gate in PumpQueue), so we don't need to drain g_outBuf on this
+ * thread — g_outBuf is exclusively the raw-TCP path's problem now.
  * ------------------------------------------------------------------------ */
 static void ws_serve_client(SOCKET c) {
     char msg[WS_MAX_MSG];
@@ -3186,26 +3241,10 @@ static void ws_serve_client(SOCKET c) {
     code = (char*)malloc(code_cap);
     if (!code) { m2_logf("[!] lua_bridge: ws: OOM allocating code buffer"); return; }
 
-    EnterCriticalSection(&g_wsClientMtx);
-    g_wsClient = c;
-    LeaveCriticalSection(&g_wsClientMtx);
-    m2_logf("[*] lua_bridge: ws: client connected");
-
     for (;;) {
         int r;
         char ack[192];
         int  ack_len;
-
-        /* Discard any pending raw-TCP output that accumulated during
-         * this session — the WS client uses Loader.WsSend for results,
-         * not the raw-TCP result_buf. Prevents unbounded growth of
-         * g_outBuf across long WS sessions. */
-        EnterCriticalSection(&g_outMtx);
-        if (g_outBuf_len > 0) {
-            g_outBuf_len = 0;
-            if (g_outBuf) g_outBuf[0] = '\0';
-        }
-        LeaveCriticalSection(&g_outMtx);
 
         r = ws_recv_message(c, msg, sizeof(msg));
         if (r <= 0) break;                        /* clean close or error */
@@ -3217,7 +3256,7 @@ static void ws_serve_client(SOCKET c) {
             continue;
         }
 
-        InQueuePush(code, strlen(code));
+        InQueuePush(code, strlen(code), 1);       /* from_ws=1 — skip g_outBuf fanout */
         m2_logf("[+] lua_bridge: ws: queued chunk (id=%s, %zu bytes)", id, strlen(code));
 
         ack_len = _snprintf_s(ack, sizeof(ack), _TRUNCATE,
@@ -3232,11 +3271,32 @@ static void ws_serve_client(SOCKET c) {
         }
     }
 
-    EnterCriticalSection(&g_wsClientMtx);
-    if (g_wsClient == c) g_wsClient = INVALID_SOCKET;
-    LeaveCriticalSection(&g_wsClientMtx);
-    m2_logf("[*] lua_bridge: ws: client disconnected");
     free(code);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Per-client worker thread. Adds this socket to the broadcast list on
+ * entry, runs the session loop, removes on exit. If the list is full
+ * (WS_MAX_CLIENTS already connected), refuses the new connection
+ * cleanly — log a line so users can see they hit the cap.
+ * ------------------------------------------------------------------------ */
+static DWORD WINAPI WsClientThread(LPVOID param) {
+    SOCKET c = (SOCKET)(uintptr_t)param;
+
+    if (!ws_add_client(c)) {
+        m2_logf("[!] lua_bridge: ws: refused client — %d clients already connected (WS_MAX_CLIENTS)",
+                WS_MAX_CLIENTS);
+        closesocket(c);
+        return 0;
+    }
+    m2_logf("[*] lua_bridge: ws: client connected (%d/%d)", g_wsClientCount, WS_MAX_CLIENTS);
+
+    ws_serve_client(c);
+
+    ws_remove_client(c);
+    closesocket(c);
+    m2_logf("[*] lua_bridge: ws: client disconnected (%d/%d)", g_wsClientCount, WS_MAX_CLIENTS);
+    return 0;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -3283,7 +3343,7 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
     addr.sin_family = AF_INET;
     addr.sin_port   = htons((u_short)g_repl_port);
     inet_pton(AF_INET, g_repl_host, &addr.sin_addr);
-    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(srv, 1) != 0) {
+    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(srv, 8) != 0) {
         m2_logf("[!] lua_bridge: bind/listen on %s:%d failed GLE=%lu",
                 g_repl_host, g_repl_port, (unsigned long)WSAGetLastError());
         closesocket(srv);
@@ -3325,17 +3385,34 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
         /* WebSocket peek-and-branch. MSG_PEEK doesn't consume the bytes,
          * so on a match ws_do_handshake starts fresh recv()s that see
          * the full request. Non-match falls through to the raw-TCP
-         * loop below with an untouched socket buffer. */
+         * loop below with an untouched socket buffer.
+         *
+         * Handshake runs inline on the server thread (fast, bounded —
+         * a full HTTP header + one Sec-WebSocket-Accept computation),
+         * then the socket is handed to a dedicated worker thread so
+         * this server thread can immediately loop back to accept the
+         * next connection. Multiple concurrent WS clients share the
+         * broadcast list; each worker runs independently. */
         if (g_ws_enabled) {
             char wsPeek[16];
             int  pn = recv(c, wsPeek, (int)sizeof(wsPeek), MSG_PEEK);
             if (pn >= 4 && memcmp(wsPeek, "GET ", 4) == 0) {
-                if (ws_do_handshake(c, NULL, 0)) {
-                    ws_serve_client(c);
-                } else {
+                if (!ws_do_handshake(c, NULL, 0)) {
                     m2_logf("[!] lua_bridge: ws: handshake failed");
+                    closesocket(c);
+                    continue;
                 }
-                closesocket(c);
+                {
+                    HANDLE h = CreateThread(NULL, 0, WsClientThread,
+                                            (LPVOID)(uintptr_t)c, 0, NULL);
+                    if (!h) {
+                        m2_logf("[!] lua_bridge: ws: CreateThread failed GLE=%lu",
+                                (unsigned long)GetLastError());
+                        closesocket(c);
+                    } else {
+                        CloseHandle(h);      /* fire-and-forget worker */
+                    }
+                }
                 continue;
             }
         }
@@ -3382,7 +3459,7 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
                     /* Submit accumulated chunk */
                     if (chunk_len > 0) {
                         m2_logf("[+] lua_bridge: queued chunk (%zu bytes)", chunk_len);
-                        InQueuePush(chunk_buf, chunk_len);
+                        InQueuePush(chunk_buf, chunk_len, 0);
                         OutAppend("[queued]", 8);
                     }
                     chunk_len = 0;

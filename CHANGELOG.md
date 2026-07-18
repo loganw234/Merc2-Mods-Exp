@@ -2,6 +2,20 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.4.1] - 2026-07-17
+
+Only `lua-bridge-DEV` bumped (0.4.0 → 0.4.1). Adds concurrent WebSocket clients — same wire contract, no user-facing API changes, no config change.
+
+### Added
+
+- **Concurrent WebSocket clients (up to 16 at once).** Each accepted WS connection is served on its own worker thread, and all connected clients receive every `{type:"log"}` and `{type:"ws"}` broadcast. Result routing is unchanged — the tagged-nonce mechanism in the reference client-side wrapper works exactly as it did on v0.4.0 because it lives in Lua-space (the client filters the shared `{type:"ws"}` stream for its own tag). This enables the natural use cases the design was already set up for: a browser console + a Python REPL + a mod's admin dashboard, all watching the same live game session simultaneously. Raw TCP is still single-client (its `<<<RUN>>>` / `<<<END>>>` line protocol is inherently 1:1); the mix of "one raw TCP + N WS" is now supported.
+  - `WS_MAX_CLIENTS = 16`. The 17th client's accept is refused cleanly (`ws_add_client` returns 0, the socket is closed, a log line records the refusal). Existing clients are unaffected.
+  - Listen backlog raised from 1 to 8 so a burst of connection attempts doesn't RST any of them.
+
+### Fixed
+
+- **Cross-transport chunk output leakage.** With multi-client comes the possibility of a WS client submitting a chunk while a raw-TCP client is connected. Previously the pump wrote every chunk's `result_buf` to `g_outBuf` (the raw-TCP output channel), which would have caused a raw-TCP client to see mystery output for chunks it didn't submit. Fixed by adding a `from_ws` provenance bit to `ChunkNode` — WS-queued chunks return their results via `Loader.WsSend` in the Lua wrapper and skip the `g_outBuf` fanout entirely. Raw-TCP and loader-queued chunks (OnKey / OnLoad / OnBoot) still use `g_outBuf` exactly as before.
+
 ## [v0.4.0] - 2026-07-17
 
 Only `lua-bridge-DEV` bumped (0.3.1 → 0.4.0). Version-family boundary: `v0.4` adds a **WebSocket transport** alongside the existing raw-TCP one, which unlocks a whole new class of client — a browser can now connect directly to the live game and drive Lua without a Python/PowerShell relay in the middle. Also adds a new Lua function for pushing values back out on a hidden channel.
