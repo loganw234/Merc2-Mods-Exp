@@ -10,3 +10,16 @@
 
 # OS cruft
 .DS_Store
+
+# Secrets / credentials -- never commit these
+*.key
+*.cer
+*.crt
+*.pem
+*.pfx
+*.p12
+*.jks
+*.keystore
+
+# Server-emulator source -- kept local, not for distribution
+mods/multiplayer-restore-DEV/server.py
