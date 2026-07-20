@@ -27,3 +27,15 @@ Once added, the experimental development builds of the mods (marked with a `(DEV
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Disclaimer
+
+This is an unofficial, non-commercial community fan project. It is **not affiliated with, associated with,
+authorized by, endorsed by, or in any way officially connected to Electronic Arts or Pandemic Studios**.
+*Mercenaries 2: World in Flames* and all related marks are the property of their respective owners.
+
+This repository contains original code only -- no game assets are redistributed. It requires your own
+legally-obtained copy of the game to be of any use.
+
+If a rights holder objects to anything in this repository, contact me and I will comply with a removal
+request.
